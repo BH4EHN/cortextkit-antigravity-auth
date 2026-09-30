@@ -44,9 +44,10 @@ whatever `event.request` the hook leaves behind through its own HTTP client, and
 core's raw HTTP/1.1 transport (agy header order, proxy support) while the host still sees a
 plain SSE response it can stream and cancel.
 
-The `oc-plugin` manifest enables only the server entry. The exported `/tui` and `/rpc` modules
-are inert and exist solely because OpenCode 2's cross-platform package resolver probes those
-subpaths even for server-only packages; OpenCode 2 continues to render its native provider UI.
+The `oc-plugin` manifest enables both server and TUI entries. The server handles provider
+requests and account operations; the TUI entry registers the three `/antigravity-*` commands,
+an independent session panel, and a home page. The `/rpc` entry defines the typed channel
+between them.
 
 ## Install
 
@@ -56,11 +57,13 @@ Install the adapter package itself (the shared core is pulled in automatically):
 npm install @cortexkit/opencode-v2-antigravity-auth
 # or from this repository (Bun workspace):
 bun install
+bun run build
 ```
 
-Register the package and the Antigravity-backed Google models in `opencode.json`.
-Use the package name for an npm installation, or the absolute package directory
-(`/path/to/antigravity-auth/packages/opencode-v2`) for a local checkout.
+In `opencode.json`, register the package name for npm installs or its absolute directory for
+local checkouts. Before registering a local checkout (`/path/to/antigravity-auth/packages/opencode-v2`),
+run `bun install` and `bun run build` from the repository root, then add the Antigravity-backed
+Google models.
 The complete model catalog is in [`example/opencode.json`](example/opencode.json).
 
 ```jsonc
@@ -83,6 +86,14 @@ The complete model catalog is in [`example/opencode.json`](example/opencode.json
 }
 ```
 
+> **Local-checkout hot reload.** Registering a live source directory makes the host watch and
+> reload the plugin on file changes. A `bun run build` / `bun run test` in the repository
+> recompiles `dist/`, and a reload landing mid-rebuild fails, dropping the plugin's
+> registrations — including the `/antigravity-*` commands — until the next successful load. In
+> that window typing a command sends it to the model as a plain prompt. The build swaps `dist/`
+> via directory renames to keep the window tiny; if the commands do not return after a rebuild,
+> restart OpenCode. For daily use, prefer the packed artifact over a live source directory.
+
 ## Accounts
 
 - Pool file: `antigravity-accounts.json` in the OpenCode config dir
@@ -97,6 +108,37 @@ The complete model catalog is in [`example/opencode.json`](example/opencode.json
   after recording rate-limit state, and specific `ACCOUNT_INELIGIBLE` / `VALIDATION_REQUIRED`
   responses disable the affected account before selecting another. Terminal transport and SSE
   errors propagate through OpenCode's native error path.
+
+## Slash commands
+
+Run these commands in the OpenCode 2 TUI. They open an Antigravity panel in a session or an
+Antigravity page from home; they do not add messages to an AI session or invoke a model. Quota
+appears in that independent panel or page. Results use ordinal labels (`Account 1`) and omit
+account e-mail addresses. The server guards a typed Antigravity slash command that reaches the
+prompt path without the TUI and rejects it before a provider request.
+
+| Command | Purpose |
+| --- | --- |
+| `/antigravity-account` | Show the pool: current marks (`*` both families, `c`/`g` per family), state, cached quota |
+| `/antigravity-account use <n>` | Pin Account n as current for both model families |
+| `/antigravity-account enable <n>` / `disable <n>` | Change the enabled flag (ineligible accounts cannot be enabled). An enabled account needing verification remains unavailable to OpenCode 2 until verification clears |
+| `/antigravity-account remove <n> confirm` | Remove an account. Without `confirm` the command only previews the removal |
+| `/antigravity-account add` | Open an OAuth URL in the panel; completion is tracked there and the account is appended to the same shared pool |
+| `/antigravity-quota` | Zero-network view of the cached quota percentages and their age |
+| `/antigravity-quota refresh` | Live quota fetch for enabled accounts; successful groups are written back keyed by refresh token |
+| `/antigravity-status` | Pool size, per-family current account, oldest cache age, pool and log paths |
+
+Every mutation goes through the core's lock-held storage mutator keyed by refresh token and then
+reloads the live pool (`reloadPool({ flushCurrent: false })`), so the on-disk pool stays
+consistent with the 1.x plugin and the standalone CLI sharing the same file. The TUI commands
+require an OpenCode 2 build with plugin TUI and RPC support.
+If OAuth saves an account but the live adapter cannot reload the pool, the panel reports that
+the account is saved and asks you to restart OpenCode. If the write cannot be confirmed, inspect
+the pool before attempting another login. If the adapter can reload the account file after an
+unconfirmed write, other accounts and commands remain available. A restart is required only when
+the account file cannot be reloaded.
+Recovery does not replay the failed command; the core loader retains its legacy migration and
+corrupt-file backup behavior.
 
 ## Models
 

@@ -1,7 +1,7 @@
 {
   "name": "@cortexkit/opencode-v2-antigravity-auth",
   "version": "2.2.1",
-  "description": "Google Antigravity server adapter for OpenCode 2.x",
+  "description": "Google Antigravity provider and TUI adapter for OpenCode 2.x",
   "type": "module",
   "license": "MIT",
   "author": "CortexKit",
@@ -35,9 +35,13 @@
     "./rpc": "./dist/rpc.js"
   },
   "oc-plugin": [
-    "server"
+    "server",
+    "tui"
   ],
   "files": [
+    "index.js",
+    "tui.js",
+    "rpc.js",
     "dist/",
     "example/",
     "README.md",
@@ -46,7 +50,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "build": "bun scripts/build.ts",
     "lint": "biome lint src test scripts example",
     "format:check": "biome format src test scripts example README.md README.zh-CN.md",
     "typecheck": "tsc --noEmit",
@@ -54,7 +58,24 @@
     "smoke:pack": "bun run build && bun scripts/smoke-pack-install.ts"
   },
   "dependencies": {
-    "@cortexkit/antigravity-auth-core": "2.2.1"
+    "@cortexkit/antigravity-auth-core": "2.2.1",
+    "zod": "^4.1.8"
+  },
+  "peerDependencies": {
+    "@opentui/core": ">=0.5.10",
+    "@opentui/solid": ">=0.5.10",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opencode-ai/plugin": "0.0.0-beta-19234"

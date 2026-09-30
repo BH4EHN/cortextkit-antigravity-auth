@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an OpenCode 2 TUI panel and slash commands for account management, quota, and adapter status.
+
+### Fixed
+
+- Preserved account-pool writes across command mutations and normalized unsupported numeric tool-schema constraints before Antigravity requests.
+
 ## [2.3.0] - 2026-09-17
 
 ### Added

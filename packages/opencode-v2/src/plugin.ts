@@ -11,6 +11,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, chmodSync, existsSync, mkdirSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import type { ServerResponse } from 'node:http'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -19,14 +20,17 @@ import { dirname, join } from 'node:path'
 
 import {
   AccountManager,
+  type AccountStorageV4,
+  type AgyRequestScope,
   AgyRequestSessionStore,
-  applyClaudeTransforms,
   ANTIGRAVITY_ENDPOINT_FALLBACKS,
-  CLAUDE_THINKING_MAX_OUTPUT_TOKENS,
+  type AntigravityTokenExchangeResult,
+  applyClaudeTransforms,
   authorizeAntigravity,
   buildAgyAgentRequestMetadata,
-  buildImageGenerationConfig,
   buildAntigravityHarnessUserAgent,
+  buildImageGenerationConfig,
+  CLAUDE_THINKING_MAX_OUTPUT_TOKENS,
   defaultAccountStorageStore,
   ensureProjectContext,
   exchangeAntigravity,
@@ -35,21 +39,18 @@ import {
   getModelFamily,
   isImageGenerationModel,
   loadAccountStorage,
+  type ManagedAccount,
   mutateAccountStorage,
   normalizeGeminiTools,
+  type OAuthAuthDetails,
   orderAgyRequestPayloadInPlace,
   parseRateLimitReason,
   parseRefreshParts,
   refreshAntigravityToken,
   resolveModelForHeaderStyle,
-  sanitizeCrossModelPayloadInPlace,
   SKIP_THOUGHT_SIGNATURE,
+  sanitizeCrossModelPayloadInPlace,
   toGeminiSchema,
-  type AccountStorageV4,
-  type AgyRequestScope,
-  type AntigravityTokenExchangeResult,
-  type ManagedAccount,
-  type OAuthAuthDetails,
 } from '@cortexkit/antigravity-auth-core'
 import type {
   Credential,
@@ -59,7 +60,16 @@ import type {
 import type { Registration } from '@opencode-ai/plugin/promise/registration'
 import type { SessionRequestKind } from '@opencode-ai/plugin/promise/session'
 
+import {
+  type AntigravityCommandRuntime,
+  type AntigravityPanelSnapshot,
+  createAntigravityCommands,
+  PoolMutationUnconfirmedError,
+  parseAccountArgs,
+} from './commands.ts'
 import { waitForAntigravityCode } from './oauth-callback.ts'
+import { makeFetchAccountQuota, refreshQuotaOnce } from './quota.ts'
+import { antigravityRpc } from './rpc.ts'
 
 type ResolvedModel = ReturnType<typeof resolveModelForHeaderStyle>
 interface GeminiPart {
@@ -123,6 +133,7 @@ interface PendingJob {
   sessionID: string
   kind: SessionRequestKind
   stream: boolean
+  signal?: AbortSignal
 }
 
 interface SendInput {
@@ -137,6 +148,7 @@ interface OpenCodeV2Dependencies {
   authorizeAntigravity: typeof authorizeAntigravity
   ensureProjectContext: typeof ensureProjectContext
   exchangeAntigravity: typeof exchangeAntigravity
+  loadAccountStorage: typeof loadAccountStorage
   mutateAccountStorage: typeof mutateAccountStorage
   refreshAntigravityToken: typeof refreshAntigravityToken
   waitForAntigravityCode: typeof waitForAntigravityCode
@@ -144,6 +156,24 @@ interface OpenCodeV2Dependencies {
 }
 
 export type OpenCodeV2DependencyOverrides = Partial<OpenCodeV2Dependencies>
+
+class OAuthPersistedNotLiveError extends Error {
+  constructor() {
+    super(
+      'Account saved to the pool, but the live adapter could not reload it. Restart OpenCode before using the account.',
+    )
+    this.name = 'OAuthPersistedNotLiveError'
+  }
+}
+
+class OAuthUnconfirmedError extends Error {
+  constructor() {
+    super(
+      'Account write could not be confirmed. Inspect the account pool before retrying this login.',
+    )
+    this.name = 'OAuthUnconfirmedError'
+  }
+}
 
 type OAuthSuccess = Extract<AntigravityTokenExchangeResult, { type: 'success' }>
 
@@ -195,6 +225,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function isAntigravitySlashCommand(text: string): boolean {
+  return /^\/antigravity-(?:account|quota|status)(?=\s|$)/.test(
+    text.trimStart(),
+  )
 }
 
 function configDir(): string {
@@ -607,6 +643,7 @@ export function createOpenCodeV2AntigravityPlugin(
     ensureProjectContext:
       overrides.ensureProjectContext ?? ensureProjectContext,
     exchangeAntigravity: overrides.exchangeAntigravity ?? exchangeAntigravity,
+    loadAccountStorage: overrides.loadAccountStorage ?? loadAccountStorage,
     mutateAccountStorage:
       overrides.mutateAccountStorage ?? mutateAccountStorage,
     refreshAntigravityToken:
@@ -627,64 +664,401 @@ export function createOpenCodeV2AntigravityPlugin(
       const activeControllers = new Set<AbortController>()
       const registrations: Registration[] = []
 
-      let accounts = await loadAccountStorage(ACCOUNTS_FILE).catch((error) => {
-        log('accounts-load-error', errorMessage(error))
-        return null
-      })
+      let accounts = await dependencies
+        .loadAccountStorage(ACCOUNTS_FILE)
+        .catch((error) => {
+          log('accounts-load-error', errorMessage(error))
+          return null
+        })
       let manager = new AccountManager(undefined, accounts, {
         store: defaultAccountStorageStore,
         storagePath: ACCOUNTS_FILE,
       })
+      let poolReloadRequired = false
+      let poolTransitioning = false
+      let poolGeneration = 0
+      const logicalByToken = new Map<string, string>()
+      let transitionDone: Promise<void> | null = null
+      let resolveTransition: (() => void) | null = null
       log('setup-start', 'accounts', manager.getTotalAccountCount())
+
+      const finishTransition = (): void => {
+        poolTransitioning = false
+        resolveTransition?.()
+        resolveTransition = null
+        transitionDone = null
+      }
+
+      const waitForPool = async (signal?: AbortSignal): Promise<void> => {
+        if (signal?.aborted) throw signal.reason
+        while (transitionDone) {
+          const settled = transitionDone
+          if (!signal) {
+            await settled
+          } else {
+            await new Promise<void>((resolve, reject) => {
+              const onAbort = (): void => {
+                signal.removeEventListener('abort', onAbort)
+                reject(signal.reason)
+              }
+              signal.addEventListener('abort', onAbort, { once: true })
+              settled.then(() => {
+                signal.removeEventListener('abort', onAbort)
+                resolve()
+              })
+              if (signal.aborted) onAbort()
+            })
+          }
+        }
+        if (poolReloadRequired)
+          throw new Error(
+            'Antigravity account pool requires an OpenCode restart',
+          )
+      }
+
+      const logicalToken = (token: string): string =>
+        logicalByToken.get(token) ?? token
+
+      const currentAccount = (token: string): ManagedAccount | undefined =>
+        manager
+          .getAccounts()
+          .find(
+            (account) =>
+              logicalToken(account.parts.refreshToken) === logicalToken(token),
+          )
+
+      const eligibleAccount = (token: string): ManagedAccount | undefined => {
+        if (poolReloadRequired || poolTransitioning) return undefined
+        const account = currentAccount(token)
+        return account?.enabled !== false &&
+          !account?.accountIneligible &&
+          !account?.verificationRequired
+          ? account
+          : undefined
+      }
+
+      const recordCompletedRequest = (
+        token: string,
+        family: ReturnType<typeof familyFor>,
+      ): void => {
+        if (poolReloadRequired || poolTransitioning) return
+        const live = currentAccount(token)
+        if (!live) return
+        manager.markRequestSuccess(live)
+        manager.markAccountUsed(live.index)
+        manager.recordRequest(live.index, family)
+        manager.requestSaveToDisk()
+      }
+
+      // A failed write may have landed. Retire the old saver before reading the
+      // authoritative pool; never replay the write to discover its outcome.
+      const settlePool = async (): Promise<void> => {
+        poolTransitioning = true
+        const previous = manager
+        try {
+          await previous.stopSaving()
+        } catch (error) {
+          log('pool-saver-stop-error', errorMessage(error))
+        }
+        try {
+          const loaded = await dependencies.loadAccountStorage(ACCOUNTS_FILE)
+          accounts = loaded
+          manager = new AccountManager(undefined, loaded, {
+            store: defaultAccountStorageStore,
+            storagePath: ACCOUNTS_FILE,
+          })
+          poolGeneration += 1
+          poolReloadRequired = false
+          finishTransition()
+        } catch (error) {
+          poolReloadRequired = true
+          finishTransition()
+          log('pool-settle-error', errorMessage(error))
+        }
+      }
+
+      const preparePoolMutation = async (): Promise<void> => {
+        await waitForPool()
+        while (poolTransitioning) await waitForPool()
+        poolTransitioning = true
+        transitionDone = new Promise<void>((resolve) => {
+          resolveTransition = resolve
+        })
+        poolGeneration += 1
+        try {
+          await manager.flushSaveToDisk()
+          await manager.stopSaving()
+        } catch (error) {
+          await settlePool()
+          throw error
+        }
+      }
 
       const reloadPool = async (
         options: { flushCurrent?: boolean } = {},
       ): Promise<void> => {
         const previous = manager
-        if (options.flushCurrent !== false) await previous.flushSaveToDisk()
         try {
-          accounts = await loadAccountStorage(ACCOUNTS_FILE)
+          if (options.flushCurrent !== false) await previous.flushSaveToDisk()
+          accounts = await dependencies.loadAccountStorage(ACCOUNTS_FILE)
           manager = new AccountManager(undefined, accounts, {
             store: defaultAccountStorageStore,
             storagePath: ACCOUNTS_FILE,
           })
+          poolGeneration += 1
           await previous.dispose().catch((error) => {
             log('previous-pool-dispose-error', errorMessage(error))
           })
+          finishTransition()
           log('pool-reloaded', manager.getTotalAccountCount())
         } catch (error) {
+          await settlePool()
           log('reload-pool-error', errorMessage(error))
-          throw error
+          throw new PoolMutationUnconfirmedError()
         }
       }
 
+      const replaceRotatedToken = async (
+        oldToken: string,
+        newToken: string,
+      ): Promise<boolean> => {
+        await preparePoolMutation()
+        let expected: AccountStorageV4['accounts'][number] | undefined
+        try {
+          await dependencies.mutateAccountStorage(ACCOUNTS_FILE, (current) => {
+            const index = current.accounts.findIndex(
+              (entry) => entry.refreshToken === oldToken,
+            )
+            if (
+              index < 0 ||
+              current.accounts.some((entry) => entry.refreshToken === newToken)
+            )
+              return current
+            const prior = current.accounts[index]
+            if (!prior) return current
+            expected = { ...prior, refreshToken: newToken }
+            return {
+              ...current,
+              accounts: current.accounts.map((entry, at) =>
+                at === index ? expected! : entry,
+              ),
+            }
+          })
+          await reloadPool({ flushCurrent: false })
+        } catch (error) {
+          if (poolTransitioning) await settlePool()
+          log('refresh-rotation-error', errorMessage(error))
+        }
+        const durable = accounts?.accounts ?? []
+        const replacement = durable.find(
+          (entry) => entry.refreshToken === newToken,
+        )
+        if (
+          poolReloadRequired ||
+          !expected ||
+          durable.some((entry) => entry.refreshToken === oldToken) ||
+          !replacement ||
+          replacement.addedAt !== expected.addedAt ||
+          replacement.lastUsed !== expected.lastUsed ||
+          replacement.enabled !== expected.enabled ||
+          replacement.projectId !== expected.projectId ||
+          replacement.managedProjectId !== expected.managedProjectId
+        )
+          return false
+        logicalByToken.set(newToken, logicalToken(oldToken))
+        return true
+      }
+
       async function accessFor(
-        account: ManagedAccount,
+        token: string,
         force = false,
-      ): Promise<OAuthAuthDetails> {
+        generation = poolGeneration,
+      ): Promise<{ auth: OAuthAuthDetails; token: string } | null> {
+        if (
+          poolReloadRequired ||
+          poolTransitioning ||
+          generation !== poolGeneration
+        )
+          return null
+        const account = eligibleAccount(token)
+        if (!account) return null
         if (
           !force &&
           account.access &&
           account.expires &&
           account.expires > Date.now() + 60_000
         ) {
-          return manager.toAuthDetails(account)
+          return { auth: manager.toAuthDetails(account), token }
         }
         const refreshed = await dependencies.refreshAntigravityToken(
           account.parts.refreshToken,
         )
+        if (generation !== poolGeneration) return null
+        if (refreshed.refresh !== token) {
+          if (!refreshed.refresh)
+            throw new Error('Antigravity refresh returned no refresh token')
+          if (!(await replaceRotatedToken(token, refreshed.refresh)))
+            throw new Error(
+              'Antigravity refresh-token rotation was not confirmed',
+            )
+          const rotated = eligibleAccount(refreshed.refresh)
+          if (!rotated) return null
+          const auth: OAuthAuthDetails = {
+            type: 'oauth',
+            refresh: formatRefreshParts({
+              refreshToken: refreshed.refresh,
+              projectId: rotated.parts.projectId,
+              managedProjectId: rotated.parts.managedProjectId,
+            }),
+            access: refreshed.access,
+            expires: refreshed.expires,
+          }
+          manager.updateFromAuth(rotated, auth)
+          return { auth, token: refreshed.refresh }
+        }
+        const current = eligibleAccount(token)
+        if (!current) return null
         const auth: OAuthAuthDetails = {
           type: 'oauth',
           refresh: formatRefreshParts({
             refreshToken: refreshed.refresh,
-            projectId: account.parts.projectId,
-            managedProjectId: account.parts.managedProjectId,
+            projectId: current.parts.projectId,
+            managedProjectId: current.parts.managedProjectId,
           }),
           access: refreshed.access,
           expires: refreshed.expires,
         }
-        manager.updateFromAuth(account, auth)
-        return auth
+        manager.updateFromAuth(current, auth)
+        return { auth, token: current.parts.refreshToken }
+      }
+
+      // Shared by the host OAuth method and the `/antigravity-account add`
+      // command: exchange the browser code, append to the pool under lock,
+      // and reload the live view.
+      async function completeAntigravityLogin(
+        code: string,
+        state: string,
+      ): Promise<Credential.OAuth> {
+        const result = await dependencies.exchangeAntigravity(code, state)
+        if (result.type === 'failed') {
+          throw new Error(`Antigravity token exchange failed: ${result.error}`)
+        }
+        const now = Date.now()
+        const refreshParts = parseRefreshParts(result.refresh)
+        if (!refreshParts.refreshToken) {
+          throw new Error(
+            'Antigravity token exchange returned no refresh token',
+          )
+        }
+        const credential: Credential.OAuth = {
+          type: 'oauth',
+          methodID: METHOD_ID,
+          refresh: formatRefreshParts({
+            refreshToken: refreshParts.refreshToken,
+            projectId: refreshParts.projectId || result.projectId || undefined,
+            managedProjectId: refreshParts.managedProjectId,
+          }),
+          access: result.access,
+          expires: result.expires,
+        }
+        const matchesTarget = (
+          candidate: unknown,
+          expected: AccountStorageV4['accounts'][number],
+        ): boolean => {
+          if (!isRecord(candidate)) return false
+          const fields = [
+            'email',
+            'label',
+            'refreshToken',
+            'projectId',
+            'managedProjectId',
+            'addedAt',
+            'lastUsed',
+            'enabled',
+            'accountIneligible',
+            'accountIneligibleAt',
+            'accountIneligibleReason',
+            'verificationRequired',
+            'verificationRequiredAt',
+            'verificationRequiredReason',
+            'eligibilityStateUpdatedAt',
+          ] as const
+          return fields.every((field) => candidate[field] === expected[field])
+        }
+        await preparePoolMutation()
+        let intended: AccountStorageV4['accounts'][number] | undefined
+        let intendedChanged = false
+        try {
+          await dependencies.mutateAccountStorage(ACCOUNTS_FILE, (current) => {
+            const next = upsertOAuthAccount(current, result, now)
+            intended = next.accounts.find(
+              (entry) => entry.refreshToken === refreshParts.refreshToken,
+            )
+            const prior = current.accounts.find((entry) =>
+              result.email
+                ? entry.email === result.email
+                : entry.refreshToken === refreshParts.refreshToken,
+            )
+            intendedChanged = Boolean(
+              intended && !matchesTarget(prior, intended),
+            )
+            return next
+          })
+          await reloadPool({ flushCurrent: false })
+        } catch {
+          if (poolTransitioning) await settlePool()
+          // Read the authoritative file without another mutation or replay.
+          // Mere presence of a preexisting token is insufficient evidence.
+          let persisted = false
+          try {
+            const raw: unknown = JSON.parse(
+              await readFile(ACCOUNTS_FILE, 'utf8'),
+            )
+            const entries =
+              typeof raw === 'object' &&
+              raw !== null &&
+              'version' in raw &&
+              raw.version === 4 &&
+              'accounts' in raw
+                ? raw.accounts
+                : undefined
+            const expected = intended
+            persisted = Boolean(
+              expected &&
+                intendedChanged &&
+                Array.isArray(entries) &&
+                entries.some((entry) => matchesTarget(entry, expected)),
+            )
+          } catch {
+            log('oauth-readback-unavailable')
+          }
+          if (
+            persisted &&
+            !poolReloadRequired &&
+            currentAccount(refreshParts.refreshToken)
+          ) {
+            return credential
+          }
+          if (persisted) throw new OAuthPersistedNotLiveError()
+          throw new OAuthUnconfirmedError()
+        }
+        log('account-added', 'pool', manager.getTotalAccountCount())
+        return credential
+      }
+
+      async function loginViaCommand(
+        announce: (message: string) => Promise<void>,
+      ): Promise<void> {
+        const authorization = await dependencies.authorizeAntigravity()
+        const state = new URL(authorization.url).searchParams.get('state')
+        if (!state) {
+          throw new Error(
+            'Antigravity authorization URL is missing OAuth state',
+          )
+        }
+        await announce(`Open this URL to sign in:\n${authorization.url}`)
+        const code = await dependencies.waitForAntigravityCode(state)
+        await completeAntigravityLogin(code, state)
       }
 
       function send(
@@ -721,14 +1095,25 @@ export function createOpenCodeV2AntigravityPlugin(
         job: PendingJob,
         signal?: AbortSignal,
       ): Promise<{ response: Response; account: ManagedAccount }> {
+        await waitForPool(signal)
         const family = familyFor(job.modelID)
         const requested = job.resolved.actualModel
         const identity = { id: job.sessionID ?? 'default', parentId: null }
-        const excluded = new Set<number>()
+        const excluded = new Set<string>()
+        const forcedRefreshes = new Set<string>()
         const poolSize = Math.max(1, manager.getEnabledAccounts().length)
         let failure: unknown = null
 
         for (let attempt = 0; attempt < poolSize + 2; attempt += 1) {
+          await waitForPool(signal)
+          const excludedIndexes = new Set(
+            manager
+              .getAccounts()
+              .filter((entry) =>
+                excluded.has(logicalToken(entry.parts.refreshToken)),
+              )
+              .map((entry) => entry.index),
+          )
           const account = manager.getCurrentOrNextForFamily(
             family,
             requested,
@@ -738,16 +1123,26 @@ export function createOpenCodeV2AntigravityPlugin(
             100,
             10 * 60_000,
             identity,
-            excluded,
+            excludedIndexes,
           )
           if (!account) break
+          let token = account.parts.refreshToken
+          const selectedGeneration = poolGeneration
 
           let auth: OAuthAuthDetails
           try {
-            auth = await accessFor(account)
+            const accessed = await accessFor(token, false, selectedGeneration)
+            await waitForPool(signal)
+            if (poolGeneration !== selectedGeneration) continue
+            if (!accessed) {
+              excluded.add(logicalToken(token))
+              continue
+            }
+            auth = accessed.auth
+            token = accessed.token
           } catch (error) {
             log('token-error', `#${account.index}`, errorMessage(error))
-            excluded.add(account.index)
+            excluded.add(logicalToken(token))
             failure = error
             continue
           }
@@ -755,10 +1150,16 @@ export function createOpenCodeV2AntigravityPlugin(
           let context: Awaited<ReturnType<typeof ensureProjectContext>>
           try {
             context = await dependencies.ensureProjectContext(auth)
+            await waitForPool(signal)
           } catch (error) {
             log('project-error', `#${account.index}`, errorMessage(error))
-            excluded.add(account.index)
+            excluded.add(logicalToken(token))
             failure = error
+            continue
+          }
+          if (poolGeneration !== selectedGeneration) continue
+          if (!eligibleAccount(token)) {
+            excluded.add(logicalToken(token))
             continue
           }
 
@@ -787,7 +1188,7 @@ export function createOpenCodeV2AntigravityPlugin(
           // A forced refresh happens at most once per account/request; if the
           // endpoint still answers 401 afterwards the account is excluded and the
           // pool selection continues instead of refreshing in an unbounded loop.
-          let forcedRefresh = false
+          let reselect = false
           for (
             let endpointIndex = 0;
             endpointIndex < ANTIGRAVITY_ENDPOINT_FALLBACKS.length;
@@ -795,6 +1196,18 @@ export function createOpenCodeV2AntigravityPlugin(
           ) {
             const endpoint = ANTIGRAVITY_ENDPOINT_FALLBACKS[endpointIndex]
             if (!endpoint) continue
+            await waitForPool(signal)
+            if (poolGeneration !== selectedGeneration) {
+              reselect = true
+              break
+            }
+            // No await between validation and dispatch. Once dispatched, its
+            // response may finish even when a command changes the pool.
+            const sendingAccount = eligibleAccount(token)
+            if (!sendingAccount) {
+              reselect = true
+              break
+            }
             let response: Response
             try {
               response = await send(envelope, auth, endpoint, signal, job.kind)
@@ -817,15 +1230,41 @@ export function createOpenCodeV2AntigravityPlugin(
             )
 
             if (response.ok) {
-              manager.markRequestSuccess(account)
-              manager.markAccountUsed(account.index)
-              manager.recordRequest(account.index, family)
-              manager.requestSaveToDisk()
-              return { response, account }
+              if (transitionDone) {
+                void waitForPool()
+                  .then(() => recordCompletedRequest(token, family))
+                  .catch((error) =>
+                    log('request-usage-record-error', errorMessage(error)),
+                  )
+              } else {
+                recordCompletedRequest(token, family)
+              }
+              return {
+                response,
+                account: currentAccount(token) ?? sendingAccount,
+              }
             }
 
             const { reason, message } = await readErrorDetails(response)
             log('upstream-error', response.status, reason ?? '', message)
+            await waitForPool(signal)
+            const live = eligibleAccount(token)
+            if (!live) {
+              reselect = true
+              break
+            }
+            if (
+              poolGeneration !== selectedGeneration &&
+              !(
+                response.status === 403 &&
+                (reason === 'ACCOUNT_INELIGIBLE' ||
+                  reason === 'VALIDATION_REQUIRED')
+              ) &&
+              response.status !== 429
+            ) {
+              reselect = true
+              break
+            }
             if (
               response.status === 404 &&
               endpointIndex < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1
@@ -833,32 +1272,47 @@ export function createOpenCodeV2AntigravityPlugin(
               continue
 
             if (response.status === 401) {
-              if (!forcedRefresh) {
+              if (!forcedRefreshes.has(logicalToken(token))) {
                 try {
-                  auth = await accessFor(account, true)
-                  forcedRefresh = true
+                  forcedRefreshes.add(logicalToken(token))
+                  const accessed = await accessFor(
+                    token,
+                    true,
+                    selectedGeneration,
+                  )
+                  if (!accessed) {
+                    reselect = true
+                    break
+                  }
+                  auth = accessed.auth
+                  token = accessed.token
+                  await waitForPool(signal)
+                  if (poolGeneration !== selectedGeneration) {
+                    reselect = true
+                    break
+                  }
                   endpointIndex -= 1
                   continue
                 } catch (error) {
                   failure = error
                 }
               }
-              excluded.add(account.index)
+              excluded.add(logicalToken(token))
               break
             }
 
             if (response.status === 403 && reason === 'ACCOUNT_INELIGIBLE') {
-              manager.markAccountIneligible(account.index, reason)
+              manager.markAccountIneligible(live.index, reason)
               await manager.flushSaveToDisk()
-              excluded.add(account.index)
+              excluded.add(logicalToken(token))
               failure = new Error('Antigravity account is ineligible')
               break
             }
 
             if (response.status === 403 && reason === 'VALIDATION_REQUIRED') {
-              manager.markAccountVerificationRequired(account.index, reason)
+              manager.markAccountVerificationRequired(live.index, reason)
               await manager.flushSaveToDisk()
-              excluded.add(account.index)
+              excluded.add(logicalToken(token))
               failure = new Error('Antigravity account requires validation')
               break
             }
@@ -870,7 +1324,7 @@ export function createOpenCodeV2AntigravityPlugin(
               if (endpointIndex < ANTIGRAVITY_ENDPOINT_FALLBACKS.length - 1)
                 continue
               manager.markRateLimitedWithReason(
-                account,
+                live,
                 family,
                 'antigravity',
                 requested,
@@ -878,7 +1332,7 @@ export function createOpenCodeV2AntigravityPlugin(
                 45_000,
                 3_600_000,
               )
-              excluded.add(account.index)
+              excluded.add(logicalToken(token))
               break
             }
 
@@ -887,7 +1341,7 @@ export function createOpenCodeV2AntigravityPlugin(
                 parseRateLimitReason(reason, '', response.status) ||
                 'RATE_LIMIT'
               manager.markRateLimitedWithReason(
-                account,
+                live,
                 family,
                 'antigravity',
                 requested,
@@ -895,7 +1349,7 @@ export function createOpenCodeV2AntigravityPlugin(
                 retryAfterMs(response) ?? 60_000,
                 3_600_000,
               )
-              excluded.add(account.index)
+              excluded.add(logicalToken(token))
               failure = new Error(
                 `Antigravity ${response.status}${reason ? ` (${reason})` : ''}`,
               )
@@ -905,13 +1359,14 @@ export function createOpenCodeV2AntigravityPlugin(
             failure = new Error(
               `Antigravity HTTP ${response.status}${reason ? ` (${reason})` : ''}`,
             )
-            excluded.add(account.index)
+            excluded.add(logicalToken(token))
             break
           }
           // Transport failures may exhaust every endpoint without producing an
           // HTTP response. Move to another account instead of selecting the same
           // account again in the outer loop.
-          excluded.add(account.index)
+          if (!reselect || poolGeneration === selectedGeneration)
+            excluded.add(logicalToken(token))
         }
 
         throw (
@@ -1127,6 +1582,9 @@ export function createOpenCodeV2AntigravityPlugin(
         const controller = new AbortController()
         activeControllers.add(controller)
         res.on('close', () => controller.abort())
+        const onOriginalAbort = (): void => controller.abort(job.signal?.reason)
+        job.signal?.addEventListener('abort', onOriginalAbort, { once: true })
+        if (job.signal?.aborted) onOriginalAbort()
 
         ;(async () => {
           const picked = await pickResponse(job, controller.signal)
@@ -1192,7 +1650,10 @@ export function createOpenCodeV2AntigravityPlugin(
               log('loopback-error-response-failed', errorMessage(responseError))
             }
           })
-          .finally(() => activeControllers.delete(controller))
+          .finally(() => {
+            job.signal?.removeEventListener('abort', onOriginalAbort)
+            activeControllers.delete(controller)
+          })
       })
 
       await new Promise<void>((resolve, reject) => {
@@ -1208,6 +1669,42 @@ export function createOpenCodeV2AntigravityPlugin(
       }
       const port = (address as AddressInfo).port
       log('loopback-listening', port)
+
+      registrations.push(
+        await ctx.session.hook('prompt', async (event) => {
+          if (isAntigravitySlashCommand(event.prompt.text)) {
+            throw new Error(
+              'Antigravity slash commands require the OpenCode TUI',
+            )
+          }
+        }),
+      )
+
+      // `opencode run` bypasses the prompt hook when it admits a raw CLI
+      // argument. Check the persisted latest user text again at the model
+      // boundary, before any provider (including non-Google providers) runs.
+      registrations.push(
+        await ctx.session.hook('model.request', async (event) => {
+          let messages: Awaited<ReturnType<typeof ctx.session.context>>
+          try {
+            messages = await ctx.session.context({ sessionID: event.sessionID })
+          } catch (error) {
+            log('model-request-context-read-error', errorMessage(error))
+            throw new Error('Could not verify Antigravity slash command safety')
+          }
+          const latestUser = messages.findLast(
+            (message) => message.type === 'user',
+          )
+          if (
+            latestUser?.type === 'user' &&
+            isAntigravitySlashCommand(latestUser.text)
+          ) {
+            throw new Error(
+              'Antigravity slash commands require the OpenCode TUI',
+            )
+          }
+        }),
+      )
 
       registrations.push(
         await ctx.session.hook('http.request', async (event) => {
@@ -1249,6 +1746,7 @@ export function createOpenCodeV2AntigravityPlugin(
               // The hook matches both endpoints; the loopback answers the streaming
               // one with SSE and the non-streaming one with a single JSON response.
               stream: /streamGenerateContent/.test(url.pathname),
+              signal: event.request.signal,
             })
             const jobTimer = setTimeout(() => {
               jobs.delete(id)
@@ -1278,6 +1776,7 @@ export function createOpenCodeV2AntigravityPlugin(
               method: 'POST',
               headers: { 'content-type': 'application/json' },
               body: '{}',
+              signal: event.request.signal,
             })
           } catch (error) {
             log('request-hook-error', errorMessage(error))
@@ -1307,42 +1806,7 @@ export function createOpenCodeV2AntigravityPlugin(
               const pending = dependencies.waitForAntigravityCode(state)
               const callback = (async () => {
                 const code = await pending
-                const result = await dependencies.exchangeAntigravity(
-                  code,
-                  state,
-                )
-                if (result.type === 'failed') {
-                  throw new Error(
-                    `Antigravity token exchange failed: ${result.error}`,
-                  )
-                }
-                const now = Date.now()
-                const refreshParts = parseRefreshParts(result.refresh)
-                if (!refreshParts.refreshToken) {
-                  throw new Error(
-                    'Antigravity token exchange returned no refresh token',
-                  )
-                }
-                await manager.flushSaveToDisk()
-                await dependencies.mutateAccountStorage(
-                  ACCOUNTS_FILE,
-                  (current) => upsertOAuthAccount(current, result, now),
-                )
-                await reloadPool({ flushCurrent: false })
-                log('account-added', 'pool', manager.getTotalAccountCount())
-                const credential: Credential.OAuth = {
-                  type: 'oauth',
-                  methodID: METHOD_ID,
-                  refresh: formatRefreshParts({
-                    refreshToken: refreshParts.refreshToken,
-                    projectId:
-                      refreshParts.projectId || result.projectId || undefined,
-                    managedProjectId: refreshParts.managedProjectId,
-                  }),
-                  access: result.access,
-                  expires: result.expires,
-                }
-                return credential
+                return completeAntigravityLogin(code, state)
               })()
               return {
                 url: authorization.url,
@@ -1378,6 +1842,250 @@ export function createOpenCodeV2AntigravityPlugin(
         }),
       )
 
+      const commandOutputs = new Map<string, string[]>()
+      const panelOutputs = new Map<
+        string,
+        { snapshot?: AntigravityPanelSnapshot; notices: string[] }
+      >()
+      const operations = new Map<
+        string,
+        {
+          state:
+            | 'pending'
+            | 'complete'
+            | 'failed'
+            | 'persisted-not-live'
+            | 'unconfirmed'
+          messages: string[]
+          notices: string[]
+          snapshot?: AntigravityPanelSnapshot
+        }
+      >()
+      let addInFlight = false
+
+      const fetchAccountQuota = makeFetchAccountQuota({
+        ensureProjectContext: dependencies.ensureProjectContext,
+        refreshAntigravityToken: dependencies.refreshAntigravityToken,
+      })
+
+      const commandRuntime: AntigravityCommandRuntime = {
+        getManager: () => manager,
+        resolveToken: (token) =>
+          currentAccount(token)?.parts.refreshToken ?? token,
+        reloadPool,
+        flushPool: preparePoolMutation,
+        mutateStorage: async (mutator) => {
+          try {
+            await dependencies.mutateAccountStorage(ACCOUNTS_FILE, mutator)
+          } catch (error) {
+            await settlePool()
+            log('pool-mutation-error', errorMessage(error))
+            throw new PoolMutationUnconfirmedError()
+          }
+        },
+        fetchPoolQuota: async () => {
+          const snapshot = manager.getAccountsForQuotaCheck()
+          const results = await refreshQuotaOnce(snapshot, fetchAccountQuota)
+          return { snapshot, results }
+        },
+        oauthAdd: loginViaCommand,
+        emit: async (callID, message) => {
+          commandOutputs.get(callID)?.push(message)
+          panelOutputs.get(callID)?.notices.push(message)
+        },
+        emitPanel: async (callID, snapshot, notice, fallbackText) => {
+          const output = panelOutputs.get(callID)
+          if (!output) return
+          output.snapshot = snapshot
+          commandOutputs.get(callID)?.push(fallbackText)
+          if (notice) output.notices.push(notice)
+        },
+        log,
+        requiresRestart: () => poolReloadRequired,
+        now: () => Date.now(),
+        accountsFile: ACCOUNTS_FILE,
+        logFile: LOGFILE,
+      }
+
+      const commandByName = new Map(
+        createAntigravityCommands(commandRuntime).map((definition) => [
+          definition.name,
+          definition,
+        ]),
+      )
+      registrations.push(
+        await ctx.rpc.register(antigravityRpc, {
+          run: async ({ name, args }) => {
+            if (poolReloadRequired) {
+              return {
+                messages: [
+                  'The Antigravity account pool requires an OpenCode restart before further commands.',
+                ],
+              }
+            }
+            if (poolTransitioning)
+              return {
+                messages: [
+                  'The Antigravity account pool is changing; retry this command shortly.',
+                ],
+              }
+            if (name === 'account' && parseAccountArgs(args).kind === 'add') {
+              if (addInFlight) {
+                return {
+                  messages: [
+                    'An Antigravity OAuth login is already in progress.',
+                  ],
+                }
+              }
+              addInFlight = true
+              const operationId = randomUUID()
+              const operation: {
+                state:
+                  | 'pending'
+                  | 'complete'
+                  | 'failed'
+                  | 'persisted-not-live'
+                  | 'unconfirmed'
+                messages: string[]
+                notices: string[]
+                snapshot?: AntigravityPanelSnapshot
+              } = { state: 'pending', messages: [], notices: [] }
+              operations.set(operationId, operation)
+              let signalReady: (value: boolean) => void = () => {}
+              const ready = new Promise<boolean>((resolve) => {
+                signalReady = resolve
+              })
+              void commandRuntime
+                .oauthAdd(async (message) => {
+                  operation.messages.push(message)
+                  operation.notices.push(message)
+                  signalReady(true)
+                })
+                .then(async () => {
+                  operation.messages.push(
+                    'Account added to the Antigravity pool.',
+                  )
+                  operation.notices.push(
+                    'Account added to the Antigravity pool.',
+                  )
+                  const callID = randomUUID()
+                  const messages: string[] = []
+                  commandOutputs.set(callID, messages)
+                  const panelOutput: {
+                    snapshot?: AntigravityPanelSnapshot
+                    notices: string[]
+                  } = { notices: [] }
+                  panelOutputs.set(callID, panelOutput)
+                  try {
+                    const list = commandByName.get('antigravity-account')
+                    if (!list)
+                      throw new Error(
+                        'Antigravity account command is unavailable',
+                      )
+                    await list.execute({
+                      sessionID: callID,
+                      prompt: { text: 'list' },
+                    } as Parameters<typeof list.execute>[0])
+                    operation.messages.push(...messages)
+                    operation.notices.push(...panelOutput.notices)
+                    operation.snapshot = panelOutput.snapshot
+                  } catch {
+                    const notice =
+                      'Account added; the account list is temporarily unavailable.'
+                    operation.messages.push(notice)
+                    operation.notices.push(notice)
+                  } finally {
+                    commandOutputs.delete(callID)
+                    panelOutputs.delete(callID)
+                  }
+                  operation.state = 'complete'
+                })
+                .catch((error) => {
+                  if (error instanceof OAuthPersistedNotLiveError) {
+                    operation.state = 'persisted-not-live'
+                    const notice =
+                      'Account saved to the pool, but the live adapter could not reload it. Restart OpenCode before using the account.'
+                    operation.messages.push(notice)
+                    operation.notices.push(notice)
+                  } else if (error instanceof OAuthUnconfirmedError) {
+                    operation.state = 'unconfirmed'
+                    const notice =
+                      'Account write could not be confirmed. Inspect the account pool before retrying this login.'
+                    operation.messages.push(notice)
+                    operation.notices.push(notice)
+                  } else {
+                    operation.state = 'failed'
+                    const notice =
+                      'Antigravity OAuth login failed. Check the adapter log before retrying.'
+                    operation.messages.push(notice)
+                    operation.notices.push(notice)
+                  }
+                  log(
+                    'oauth-add-error',
+                    error instanceof Error ? error.name : 'unknown',
+                  )
+                  signalReady(false)
+                })
+                .finally(() => {
+                  addInFlight = false
+                  setTimeout(
+                    () => operations.delete(operationId),
+                    10 * 60_000,
+                  ).unref()
+                })
+              const announced = await ready
+              return announced
+                ? {
+                    messages: [...operation.messages],
+                    notices: [...operation.notices],
+                    operationId,
+                    snapshot: operation.snapshot,
+                  }
+                : {
+                    messages: [...operation.messages],
+                    notices: [...operation.notices],
+                  }
+            }
+            const definition = commandByName.get(`antigravity-${name}`)
+            if (!definition)
+              throw new Error('Antigravity command is unavailable')
+            const callID = randomUUID()
+            const messages: string[] = []
+            const panelOutput: {
+              snapshot?: AntigravityPanelSnapshot
+              notices: string[]
+            } = { notices: [] }
+            commandOutputs.set(callID, messages)
+            panelOutputs.set(callID, panelOutput)
+            try {
+              await definition.execute({
+                sessionID: callID,
+                prompt: { text: args },
+              } as Parameters<typeof definition.execute>[0])
+              return {
+                messages,
+                notices: [...panelOutput.notices],
+                snapshot: panelOutput.snapshot,
+              }
+            } finally {
+              commandOutputs.delete(callID)
+              panelOutputs.delete(callID)
+            }
+          },
+          operation: async ({ operationId }) => {
+            const operation = operations.get(operationId)
+            if (!operation)
+              throw new Error('Antigravity operation is unavailable or expired')
+            return {
+              state: operation.state,
+              messages: [...operation.messages],
+              notices: [...operation.notices],
+              snapshot: operation.snapshot,
+            }
+          },
+        }),
+      )
+
       return async () => {
         for (const registration of registrations.reverse()) {
           await registration
@@ -1394,12 +2102,14 @@ export function createOpenCodeV2AntigravityPlugin(
         server.closeAllConnections?.()
         await new Promise<void>((resolve) => server.close(() => resolve()))
         requestSessions.clear()
-        await manager
-          .flushSaveToDisk()
-          .catch((error) => log('pool-flush-error', errorMessage(error)))
-        await manager
-          .dispose()
-          .catch((error) => log('pool-dispose-error', errorMessage(error)))
+        if (!poolReloadRequired && !poolTransitioning) {
+          await manager
+            .flushSaveToDisk()
+            .catch((error) => log('pool-flush-error', errorMessage(error)))
+          await manager
+            .dispose()
+            .catch((error) => log('pool-dispose-error', errorMessage(error)))
+        }
         log('dispose')
       }
     },

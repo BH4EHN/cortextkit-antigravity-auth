@@ -41,8 +41,9 @@ OpenCode 2.x                          本插件                        Antigravi
 回环端点既保留了 core 的原始 HTTP/1.1 传输（agy 的 header 顺序、代理支持），又让宿主看到一个
 可以正常流式读取与取消的 SSE 响应。
 
-`oc-plugin` 清单只启用 server 入口。导出的 `/tui` 与 `/rpc` 模块是惰性的，仅用于兼容
-OpenCode 2 跨平台包解析器对这些子路径的探测；界面仍由 OpenCode 2 的原生 provider UI 渲染。
+`oc-plugin` 清单同时启用 server 与 TUI 入口。server 负责 provider 请求和账号操作；
+TUI 注册三个 `/antigravity-*` 命令、独立会话面板和首页插件页面。`/rpc` 定义两者之间的
+类型化通信接口。
 
 ## 安装
 
@@ -50,9 +51,11 @@ OpenCode 2 跨平台包解析器对这些子路径的探测；界面仍由 OpenC
 npm install @cortexkit/opencode-v2-antigravity-auth
 # 或从本仓库（Bun workspace）：
 bun install
+bun run build
 ```
 
-在 `opencode.json` 中注册 npm 包和 Antigravity 模型。本地检出时，可将包名替换为包目录的绝对路径
+在 `opencode.json` 中注册 npm 包和 Antigravity 模型。使用本地检出时，请先在仓库根目录运行
+`bun install` 和 `bun run build`，然后注册包目录的绝对路径
 （`/path/to/antigravity-auth/packages/opencode-v2`）。完整模型配置见
 [`example/opencode.json`](example/opencode.json)。
 
@@ -89,6 +92,25 @@ bun install
 - 账号选择使用 core 的 `hybrid` 策略。`401` 只强制刷新一次 token，`429` 会记录限流状态并轮换；
   明确的 `ACCOUNT_INELIGIBLE` / `VALIDATION_REQUIRED` 会先停用受影响账号，再选择其他账号。
   最终传输和 SSE 错误会进入 OpenCode 原生错误路径。
+
+## TUI 命令
+
+在 OpenCode 2 的 TUI 中使用 `/antigravity-account`、`/antigravity-quota` 和
+`/antigravity-status`。命令在会话中打开独立面板；从首页运行时打开插件页面，
+不会向 AI 会话添加消息或调用模型。账号用 `Account 1` 等序号表示，不显示邮箱。
+
+- `/antigravity-account [list|use <n>|enable <n>|disable <n>]` 查看或调整账号池。
+  已启用但仍需验证的账号在验证完成前不会被 OpenCode 2 选用。
+- `/antigravity-account remove <n>` 仅预览；追加 `confirm` 才会删除。
+- `/antigravity-account add` 显示 OAuth 地址，并在面板中跟踪完成状态。
+- `/antigravity-quota [refresh]` 查看缓存或刷新实时额度。
+- `/antigravity-status` 查看账号池与缓存状态。
+
+若 TUI 命令未加载，服务器会在提示词进入 provider 请求前拒绝以这三个斜杠命令开头的输入。
+若 OAuth 已写入账号池但运行中的适配器无法重新加载，面板会提示重启 OpenCode；
+若无法确认写入结果，请先检查账号池再尝试登录。若适配器能重新读取账号文件，
+其他账号和命令仍可继续使用；只有无法重新加载账号文件时才需要重启。
+恢复时不会重放失败的命令；core 加载器仍按既有规则迁移旧版账号池，并备份损坏文件。
 
 ## 模型
 
