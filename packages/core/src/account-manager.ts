@@ -350,6 +350,7 @@ export class AccountManager {
   private saveTimeout: ReturnType<typeof setTimeout> | null = null
   private saveInFlight: Promise<void> | null = null
   private disposed = false
+  private persistenceStopped = false
   private savePromiseResolvers: Array<{
     resolve: () => void
     reject: (err: unknown) => void
@@ -1752,6 +1753,9 @@ export class AccountManager {
   }
 
   async flushSaveToDisk(): Promise<void> {
+    if (this.persistenceStopped) {
+      throw new Error('Account manager persistence has stopped')
+    }
     if (!this.savePending) {
       await this.saveInFlight
       return
@@ -1760,6 +1764,33 @@ export class AccountManager {
       this.savePromiseResolvers.push({ resolve, reject })
     })
   }
+
+  /**
+   * Retire a manager before a lock-held pool mutation. A stale manager must
+   * never merge a deferred snapshot back over the newly mutated pool.
+   * The caller should flush intended state first, then await this method
+   * before starting the mutation.
+   */
+  async stopSaving(): Promise<void> {
+    if (this.persistenceStopped) {
+      await this.saveInFlight
+      return
+    }
+    this.persistenceStopped = true
+    this.disposed = true
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout)
+      this.saveTimeout = null
+    }
+    this.savePending = false
+    const resolvers = this.savePromiseResolvers
+    this.savePromiseResolvers = []
+    for (const { reject } of resolvers) {
+      reject(new Error('Account manager persistence has stopped'))
+    }
+    await this.saveInFlight
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
