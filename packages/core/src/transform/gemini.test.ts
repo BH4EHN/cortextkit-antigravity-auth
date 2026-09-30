@@ -1534,6 +1534,69 @@ describe('transform/gemini', () => {
     })
   })
 
+  describe('toGeminiSchema - unsupported numeric constraints', () => {
+    it('moves unsupported bounds to descriptions recursively and preserves supported bounds', () => {
+      const schema = {
+        type: 'object',
+        properties: {
+          value: {
+            type: 'number',
+            description: 'A bounded value',
+            minimum: 1,
+            maximum: 10,
+            exclusiveMinimum: 0,
+            exclusiveMaximum: 11,
+            multipleOf: 0.5,
+          },
+          nested: {
+            type: 'array',
+            items: { type: 'integer', exclusiveMinimum: 2 },
+          },
+        },
+      }
+
+      const result = toGeminiSchema(schema) as Record<string, unknown>
+      const properties = result.properties as Record<string, unknown>
+      const value = properties.value as Record<string, unknown>
+      const nested = properties.nested as Record<string, unknown>
+      const items = nested.items as Record<string, unknown>
+
+      expect(value).toMatchObject({
+        type: 'NUMBER',
+        description:
+          'A bounded value (must be greater than 0, must be less than 11, must be a multiple of 0.5)',
+        minimum: 1,
+        maximum: 10,
+      })
+      expect(value).not.toHaveProperty('exclusiveMinimum')
+      expect(value).not.toHaveProperty('exclusiveMaximum')
+      expect(value).not.toHaveProperty('multipleOf')
+      expect(items).toEqual({
+        type: 'INTEGER',
+        description: 'must be greater than 2',
+      })
+    })
+
+    it('preserves legacy numeric hint formatting when requested', () => {
+      const result = toGeminiSchema(
+        {
+          type: 'number',
+          exclusiveMinimum: 0,
+          exclusiveMaximum: 10,
+          multipleOf: 0.5,
+        },
+        { moveNumericConstraintsToDescription: true },
+      ) as Record<string, unknown>
+
+      expect(result.description).toBe(
+        'exclusiveMinimum: 0, exclusiveMaximum: 10, multipleOf: 0.5',
+      )
+      expect(result).not.toHaveProperty('exclusiveMinimum')
+      expect(result).not.toHaveProperty('exclusiveMaximum')
+      expect(result).not.toHaveProperty('multipleOf')
+    })
+  })
+
   describe('applyGeminiTransforms - full integration', () => {
     it('wraps tools in functionDeclarations after normalization', () => {
       const payload: RequestPayload = {
@@ -1569,6 +1632,47 @@ describe('transform/gemini', () => {
       expect(params.type).toBe('OBJECT')
       const props = params.properties as Record<string, Record<string, string>>
       expect(props.x?.type).toBe('STRING')
+    })
+
+    it('cleans unsupported numeric constraints from direct function tool schemas', () => {
+      const payload: RequestPayload = {
+        contents: [],
+        tools: [
+          {
+            function: {
+              name: 'read_value',
+              input_schema: {
+                type: 'object',
+                properties: {
+                  value: {
+                    type: 'number',
+                    exclusiveMinimum: 0,
+                    maximum: 10,
+                  },
+                },
+              },
+            },
+          },
+        ],
+      }
+
+      applyGeminiTransforms(payload, { model: 'gemini-3.7-flash-medium' })
+
+      const tools = payload.tools as Array<Record<string, unknown>>
+      const declarations = tools[0]?.functionDeclarations as Array<
+        Record<string, unknown>
+      >
+      const parameters = declarations[0]?.parameters as Record<string, unknown>
+      const properties = parameters.properties as Record<
+        string,
+        Record<string, unknown>
+      >
+
+      expect(properties.value).toEqual({
+        type: 'NUMBER',
+        description: 'must be greater than 0',
+        maximum: 10,
+      })
     })
 
     it('normalizes existing GPT-OSS function declarations and numeric constraints', () => {

@@ -285,4 +285,90 @@ describe('OpenCode 2 Antigravity request envelope', () => {
       functionCallingConfig: { mode: 'VALIDATED' },
     })
   })
+
+  it('removes unsupported numeric schema fields from the final Gemini envelope', () => {
+    const payload = {
+      contents: [{ role: 'user', parts: [{ text: 'Use a tool' }] }],
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: 'search',
+              parameters: {
+                type: 'OBJECT',
+                properties: {
+                  query: {
+                    type: 'STRING',
+                    description: 'Search query',
+                  },
+                },
+                required: ['query'],
+              },
+            },
+            {
+              name: 'read_value',
+              parameters: {
+                type: 'object',
+                properties: {
+                  value: {
+                    type: 'number',
+                    description: 'A bounded value',
+                    minimum: 1,
+                    maximum: 10,
+                    exclusiveMinimum: 0,
+                    exclusiveMaximum: 11,
+                    multipleOf: 0.5,
+                  },
+                },
+              },
+            },
+          ],
+        },
+      ],
+    }
+    const resolved = resolveModelForHeaderStyle(
+      'gemini-3.8-flash-high',
+      'antigravity',
+    )
+
+    const envelope = buildEnvelope(
+      payload,
+      resolved,
+      'project-gemini-schema',
+      scopeForRequest(),
+    )
+    expect(envelope.model).toBe('gemini-3.8-flash-high')
+    const tools = envelope.request.tools as Array<{
+      functionDeclarations: Array<{
+        name: string
+        parameters: Record<string, unknown>
+      }>
+    }>
+    const declarations = tools[0]?.functionDeclarations
+    expect(declarations).toHaveLength(2)
+    expect(declarations?.map(({ name }) => name)).toEqual([
+      'search',
+      'read_value',
+    ])
+    expect(declarations?.[0]).toEqual({
+      name: 'search',
+      parameters: {
+        type: 'OBJECT',
+        properties: { query: { type: 'STRING', description: 'Search query' } },
+        required: ['query'],
+      },
+    })
+    const parameters = declarations?.[1]?.parameters
+    const properties = parameters?.properties as
+      | Record<string, Record<string, unknown>>
+      | undefined
+
+    expect(properties?.value).toEqual({
+      type: 'NUMBER',
+      description:
+        'A bounded value (must be greater than 0, must be less than 11, must be a multiple of 0.5)',
+      minimum: 1,
+      maximum: 10,
+    })
+  })
 })

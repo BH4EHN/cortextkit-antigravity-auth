@@ -68,6 +68,12 @@ const NUMERIC_SCHEMA_CONSTRAINTS = new Set([
   'multipleOf',
 ])
 
+const UNSUPPORTED_NUMERIC_SCHEMA_CONSTRAINTS = new Set([
+  'exclusiveMinimum',
+  'exclusiveMaximum',
+  'multipleOf',
+])
+
 export interface GeminiSchemaOptions {
   /**
    * AGY's GPT bridge re-encodes protobuf numeric constraints as strings before
@@ -102,6 +108,20 @@ export function toGeminiSchema(
   for (const [key, value] of Object.entries(inputSchema)) {
     // Skip unsupported fields that Gemini API rejects
     if (UNSUPPORTED_SCHEMA_FIELDS.has(key)) {
+      continue
+    }
+
+    if (UNSUPPORTED_NUMERIC_SCHEMA_CONSTRAINTS.has(key)) {
+      if (typeof value === 'string' || typeof value === 'number') {
+        const hint = options.moveNumericConstraintsToDescription
+          ? `${key}: ${value}`
+          : key === 'exclusiveMinimum'
+            ? `must be greater than ${value}`
+            : key === 'exclusiveMaximum'
+              ? `must be less than ${value}`
+              : `must be a multiple of ${value}`
+        numericConstraintHints.push(hint)
+      }
       continue
     }
 
