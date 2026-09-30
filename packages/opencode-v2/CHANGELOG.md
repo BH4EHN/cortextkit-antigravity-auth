@@ -5,6 +5,7 @@
 ### Added
 
 - Added an OpenCode 2 TUI panel and slash commands for account management, quota, and adapter status.
+- Added a session right-sidebar quota view for selected Antigravity models, with cache-first process-memory updates across all accounts and both quota families.
 
 ### Fixed
 

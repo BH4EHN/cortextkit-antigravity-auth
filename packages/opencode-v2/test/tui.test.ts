@@ -1,6 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, jest, test } from 'bun:test'
 import { testRender } from '@opentui/solid'
-
+import { createSignal } from 'solid-js'
+import type { SidebarQuotaSnapshot } from '../src/rpc.ts'
 import { tui } from '../src/tui.tsx'
 
 type Command = {
@@ -26,7 +27,11 @@ function setup(
     operation?:
       | Record<string, unknown>
       | (() => Promise<Record<string, unknown>>)
+    sidebarQuota?:
+      | SidebarQuotaSnapshot
+      | ((input: { mode: 'cache' | 'ensure' }) => Promise<SidebarQuotaSnapshot>)
   } = {},
+  dataOptions: { syncSession?: () => Promise<void> } = {},
 ) {
   let currentRoute = route
   const layers: Array<() => Layer> = []
@@ -36,9 +41,23 @@ function setup(
   const navigations: unknown[] = []
   let panelOpenCount = 0
   const calls: Array<{ name: string; args: string }> = []
+  const sidebarCalls: Array<'cache' | 'ensure'> = []
+  const sessions = new Map<
+    string,
+    { model?: { providerID: string; id: string } }
+  >()
+  const listeners = new Set<(event: unknown) => void>()
+  let renderSidebar: ((input: { sessionID: string }) => unknown) | undefined
   const ctx = {
     client: {
       rpc: () => ({
+        sidebarQuota: async (input: { mode: 'cache' | 'ensure' }) => {
+          sidebarCalls.push(input.mode)
+          const result = rpcResults.sidebarQuota
+          return typeof result === 'function'
+            ? result(input)
+            : (result ?? { accounts: [], notices: [] })
+        },
         run: async (input: { name: string; args: string }) => {
           calls.push(input)
           return typeof rpcResults.run === 'function'
@@ -83,9 +102,23 @@ function setup(
       },
       slot: (claim: { append: string; render: () => unknown }) => {
         if (claim.append === 'app') claim.render()
+        if (claim.append === 'sidebar.content')
+          renderSidebar = claim.render as (input: {
+            sessionID: string
+          }) => unknown
         return () => {}
       },
       toast: { show: () => {} },
+    },
+    data: {
+      session: {
+        get: (id: string) => sessions.get(id),
+        sync: async () => dataOptions.syncSession?.(),
+      },
+      on: (_type: string, handler: (event: unknown) => void) => {
+        listeners.add(handler)
+        return () => listeners.delete(handler)
+      },
     },
     theme: {
       current: {
@@ -124,10 +157,65 @@ function setup(
     get renderPage() {
       return renderPage
     },
+    get renderSidebar() {
+      return renderSidebar
+    },
+    sidebarCalls,
+    selectModel(sessionID: string, model?: { providerID: string; id: string }) {
+      sessions.set(sessionID, { model })
+      for (const listener of listeners)
+        listener({
+          type: 'session.model.selected',
+          data: { sessionID, model },
+        })
+    },
     get navigations() {
       return navigations
     },
     cleanup,
+  }
+}
+
+function sidebarSnapshot(
+  remainingPercent: number | null,
+  source: 'cache' | 'live' = 'cache',
+): SidebarQuotaSnapshot {
+  const cell = {
+    remainingPercent,
+    source,
+    updatedAt: Date.now() - 60_000,
+    refreshState: 'idle' as const,
+    windows: [
+      {
+        name: '5h' as const,
+        remainingPercent,
+        resetAt: Date.now() + 3_600_000,
+      },
+      {
+        name: 'weekly' as const,
+        remainingPercent: 14,
+        resetAt: Date.now() + 4 * 24 * 60 * 60_000,
+      },
+    ],
+  }
+  return {
+    notices: [],
+    accounts: [
+      {
+        label: 'Default account',
+        state: 'active',
+        current: 'both',
+        gemini: cell,
+        nonGemini: { ...cell, remainingPercent: 0 },
+      },
+      {
+        label: 'Disabled account',
+        state: 'disabled',
+        current: 'none',
+        gemini: { ...cell, remainingPercent: null },
+        nonGemini: { ...cell, remainingPercent: 22 },
+      },
+    ],
   }
 }
 
@@ -611,6 +699,311 @@ describe('OpenCode 2 TUI slash commands', () => {
     } finally {
       await mounted.cleanup?.()
       rendered.renderer.destroy()
+    }
+  })
+})
+
+describe('OpenCode 2 quota sidebar', () => {
+  test('renders all-account quota groups and follows committed model changes', async () => {
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-1' },
+      { sidebarQuota: sidebarSnapshot(63) },
+    )
+    mounted.selectModel('session-1', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const [activeSession, setActiveSession] = createSignal('session-1')
+    const slotInput = {
+      get sessionID() {
+        return activeSession()
+      },
+    }
+    const rendered = await testRender(
+      () => mounted.renderSidebar!(slotInput) as never,
+      { width: 42, height: 36 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      let frame = rendered.captureCharFrame()
+      expect(frame).toContain('Antigravity quota')
+      expect(frame).toContain('Default account')
+      expect(frame).toContain('Disabled account')
+      expect(frame).toContain('Gemini: 63%')
+      expect(frame).toContain('Claude / other: 0%')
+      expect(frame).toContain('Gemini: —')
+      expect(frame).toContain('Weekly 14%')
+      expect(frame).toContain('Default')
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+
+      mounted.selectModel('session-1', {
+        providerID: 'google',
+        id: 'claude-sonnet-4-6-thinking',
+      })
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Claude / other: 0%')
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+
+      mounted.selectModel('session-1', {
+        providerID: 'openai',
+        id: 'gemini-3.8-flash',
+      })
+      await rendered.flush()
+      frame = rendered.captureCharFrame()
+      expect(frame).not.toContain('Antigravity quota')
+
+      mounted.selectModel('session-2', {
+        providerID: 'google',
+        id: 'claude-opus-4-6-thinking',
+      })
+      setActiveSession('session-2')
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Antigravity quota')
+      expect(mounted.sidebarCalls).toEqual([
+        'cache',
+        'ensure',
+        'cache',
+        'ensure',
+      ])
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('keeps cached values on transport failure and ignores hidden late results', async () => {
+    let resolveEnsure!: (value: SidebarQuotaSnapshot) => void
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-2' },
+      {
+        sidebarQuota: ({ mode }) =>
+          mode === 'cache'
+            ? Promise.resolve(sidebarSnapshot(41))
+            : new Promise((resolve) => {
+                resolveEnsure = resolve
+              }),
+      },
+    )
+    mounted.selectModel('session-2', {
+      providerID: 'google',
+      id: 'claude-opus-4-6-thinking',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-2' }) as never,
+      { width: 48, height: 40 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Gemini: 41%')
+      mounted.selectModel('session-2', {
+        providerID: 'openai',
+        id: 'other-model',
+      })
+      resolveEnsure(sidebarSnapshot(99, 'live'))
+      await Bun.sleep(0)
+      await rendered.flush()
+      const hiddenFrame = rendered.captureCharFrame()
+      expect(hiddenFrame).not.toContain('Antigravity quota')
+      expect(hiddenFrame).not.toContain('99%')
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('preserves cache age and hides raw transport errors after refresh failure', async () => {
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-4' },
+      {
+        sidebarQuota: async ({ mode }) => {
+          if (mode === 'cache') return sidebarSnapshot(27)
+          throw new Error('sensitive transport detail')
+        },
+      },
+    )
+    mounted.selectModel('session-4', {
+      providerID: 'google',
+      id: 'gemini-3.6-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-4' }) as never,
+      { width: 42, height: 36 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const frame = rendered.captureCharFrame()
+      expect(frame).toContain('Gemini: 27%')
+      expect(frame).toContain('Cached 1m ago')
+      expect(frame).toContain('Quota refresh failed')
+      expect(frame).not.toContain('sensitive transport detail')
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('keeps cache-first polling serialized while RPC results are pending', async () => {
+    let resolveCache!: (value: SidebarQuotaSnapshot) => void
+    const resolveEnsures: Array<(value: SidebarQuotaSnapshot) => void> = []
+    const pollCallbacks: Array<() => void> = []
+    const scheduled = jest.spyOn(globalThis, 'setInterval')
+    scheduled.mockImplementation(((handler: TimerHandler, delay?: number) => {
+      if (delay === 15_000 && typeof handler === 'function')
+        pollCallbacks.push(handler as () => void)
+      return 1 as never
+    }) as typeof setInterval)
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-overlap' },
+      {
+        sidebarQuota: ({ mode }) =>
+          mode === 'cache'
+            ? new Promise((resolve) => {
+                resolveCache = resolve
+              })
+            : new Promise((resolve) => resolveEnsures.push(resolve)),
+      },
+    )
+    mounted.selectModel('session-overlap', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-overlap' }) as never,
+      { width: 48, height: 36 },
+    )
+    try {
+      await Bun.sleep(0)
+      expect(mounted.sidebarCalls).toEqual(['cache'])
+      pollCallbacks[0]!()
+      await Bun.sleep(0)
+      expect(mounted.sidebarCalls).toEqual(['cache'])
+
+      resolveCache(sidebarSnapshot(12))
+      await Bun.sleep(0)
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+      expect(resolveEnsures).toHaveLength(1)
+      pollCallbacks[0]!()
+      await Bun.sleep(0)
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+
+      resolveEnsures[0]!(sidebarSnapshot(30, 'live'))
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Gemini: 30%')
+      pollCallbacks[0]!()
+      await Bun.sleep(0)
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure', 'ensure'])
+      expect(resolveEnsures).toHaveLength(2)
+      resolveEnsures[1]!(sidebarSnapshot(45, 'live'))
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Gemini: 45%')
+    } finally {
+      rendered.renderer.destroy()
+      await mounted.cleanup?.()
+      scheduled.mockRestore()
+    }
+  })
+
+  test('reports session hydration failure safely and waits for a valid model', async () => {
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-hydration' },
+      { sidebarQuota: sidebarSnapshot(12) },
+      {
+        syncSession: async () => {
+          throw new Error('private model sync failure')
+        },
+      },
+    )
+    mounted.selectModel('session-hydration', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-hydration' }) as never,
+      { width: 48, height: 40 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const frame = rendered.captureCharFrame()
+      expect(frame).toContain('Default account')
+      expect(frame).toContain('Could not load the selected session model yet.')
+      expect(frame).not.toContain('private model sync failure')
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+    } finally {
+      rendered.renderer.destroy()
+      await mounted.cleanup?.()
+    }
+  })
+
+  test('unknown and third-party provider models never activate the sidebar', async () => {
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-3' },
+      {
+        sidebarQuota: sidebarSnapshot(10),
+      },
+    )
+    mounted.selectModel('session-3', {
+      providerID: 'google',
+      id: 'gemini-unknown',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-3' }) as never,
+      { width: 42, height: 16 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).not.toContain('Antigravity quota')
+      expect(mounted.sidebarCalls).toEqual([])
+      mounted.selectModel('session-3', {
+        providerID: 'google',
+        id: 'gemini-3.7-flash',
+      })
+      await rendered.flush()
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('unmount stops polling and removes the session model listener', async () => {
+    const scheduled = jest.spyOn(globalThis, 'setInterval')
+    const canceled = jest.spyOn(globalThis, 'clearInterval')
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-cleanup' },
+      { sidebarQuota: sidebarSnapshot(10) },
+    )
+    mounted.selectModel('session-cleanup', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-cleanup' }) as never,
+      { width: 42, height: 20 },
+    )
+    try {
+      await Bun.sleep(0)
+      expect(scheduled).toHaveBeenCalled()
+      const callsBeforeUnmount = mounted.sidebarCalls.length
+      rendered.renderer.destroy()
+      expect(canceled).toHaveBeenCalled()
+      mounted.selectModel('session-cleanup', {
+        providerID: 'google',
+        id: 'claude-sonnet-4-6-thinking',
+      })
+      await Bun.sleep(0)
+      expect(mounted.sidebarCalls).toHaveLength(callsBeforeUnmount)
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      scheduled.mockRestore()
+      canceled.mockRestore()
     }
   })
 })

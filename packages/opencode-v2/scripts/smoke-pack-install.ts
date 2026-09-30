@@ -26,6 +26,9 @@ type Rendered = {
 }
 
 type TuiHandlers = {
+  sidebarQuota(input: {
+    mode: 'cache' | 'ensure'
+  }): Promise<Record<string, unknown>>
   run(input: { name: string; args: string }): Promise<Record<string, unknown>>
   operation(input: { operationId: string }): Promise<Record<string, unknown>>
 }
@@ -87,6 +90,7 @@ async function verifyInstalledTui(
   }
 
   let handlers: TuiHandlers = {
+    sidebarQuota: async () => ({ accounts: [], notices: [] }),
     run: async () => ({ messages: [] }),
     operation: async () => ({ state: 'complete', messages: [] }),
   }
@@ -94,9 +98,17 @@ async function verifyInstalledTui(
   let route: TuiRoute = { type: 'home' }
   let panel: { name: string; sessionID: string } | undefined
   let page: (() => unknown) | undefined
+  let sidebar: ((input: { sessionID: string }) => unknown) | undefined
+  const sessions = new Map<
+    string,
+    { model?: { providerID: string; id: string } }
+  >()
+  const listeners = new Set<(event: unknown) => void>()
   const ctx = {
     client: {
       rpc: () => ({
+        sidebarQuota: (input: { mode: 'cache' | 'ensure' }) =>
+          handlers.sidebarQuota(input),
         run: (input: { name: string; args: string }) => handlers.run(input),
         operation: (input: { operationId: string }) =>
           handlers.operation(input),
@@ -131,9 +143,21 @@ async function verifyInstalledTui(
       },
       slot: (input: { append: string; render(): unknown }) => {
         if (input.append === 'app') input.render()
+        if (input.append === 'sidebar.content')
+          sidebar = input.render as (value: { sessionID: string }) => unknown
         return () => {}
       },
       toast: { show: () => {} },
+    },
+    data: {
+      session: {
+        get: (sessionID: string) => sessions.get(sessionID),
+        sync: async () => {},
+      },
+      on: (_type: string, handler: (event: unknown) => void) => {
+        listeners.add(handler)
+        return () => listeners.delete(handler)
+      },
     },
     theme: {
       current: {
@@ -176,6 +200,11 @@ async function verifyInstalledTui(
     width: 80,
     height: 26,
   })
+  const sidebarSessionID = 'packed-sidebar-session'
+  sessions.set(sidebarSessionID, {
+    model: { providerID: 'google', id: 'gemini-3.8-flash' },
+  })
+  let sidebarRendered: Rendered | undefined
   try {
     assertContains(await settle(rendered), 'Esc: Close', 'close footer')
     command('antigravity-quota').run()
@@ -319,9 +348,70 @@ async function verifyInstalledTui(
     if (frame.includes('Late OAuth completion')) {
       throw new Error('Late OAuth completion replaced the newer status view')
     }
+
+    let resolveFresh!: (value: Record<string, unknown>) => void
+    const sidebarCell = (percent: number, source: 'cache' | 'live') => ({
+      remainingPercent: percent,
+      source,
+      updatedAt: Date.now(),
+      refreshState: 'idle',
+      windows: [
+        { name: '5h', remainingPercent: percent, resetAt: Date.now() + 60_000 },
+        {
+          name: 'weekly',
+          remainingPercent: 18,
+          resetAt: Date.now() + 86_400_000,
+        },
+      ],
+    })
+    const sidebarResult = (percent: number, source: 'cache' | 'live') => ({
+      notices: [],
+      accounts: [
+        {
+          label: 'Packed sidebar account',
+          state: 'active',
+          current: 'both',
+          gemini: sidebarCell(percent, source),
+          nonGemini: sidebarCell(12, source),
+        },
+      ],
+    })
+    handlers.sidebarQuota = ({ mode }) =>
+      mode === 'cache'
+        ? Promise.resolve(sidebarResult(61, 'cache'))
+        : new Promise((resolve) => {
+            resolveFresh = resolve
+          })
+    sidebarRendered = await solid.testRender(
+      () => sidebar!({ sessionID: sidebarSessionID }),
+      { width: 44, height: 32 },
+    )
+    frame = await settle(sidebarRendered)
+    assertContains(frame, 'Packed sidebar account', 'sidebar cache')
+    assertContains(frame, 'Gemini: 61%', 'sidebar cache')
+    assertContains(frame, 'Weekly 18%', 'sidebar windows')
+    resolveFresh(sidebarResult(88, 'live'))
+    frame = await settle(sidebarRendered)
+    assertContains(frame, 'Gemini: 88%', 'sidebar fresh quota')
+    sessions.set(sidebarSessionID, {
+      model: { providerID: 'openai', id: 'gpt-4o' },
+    })
+    for (const listener of listeners)
+      listener({
+        type: 'session.model.selected',
+        data: {
+          sessionID: sidebarSessionID,
+          model: { providerID: 'openai', id: 'gpt-4o' },
+        },
+      })
+    frame = await settle(sidebarRendered)
+    if (frame.includes('Antigravity quota')) {
+      throw new Error('Packed sidebar remained visible after model switch')
+    }
   } finally {
     cleanup()
     rendered.renderer.destroy()
+    sidebarRendered?.renderer.destroy()
   }
 }
 

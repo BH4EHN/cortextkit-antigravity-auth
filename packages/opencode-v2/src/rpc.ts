@@ -22,6 +22,26 @@ const accountRow = z.object({
   cacheUpdatedAt: z.number().optional(),
 })
 
+const sidebarQuotaCell = quotaCell.extend({
+  source: z.enum(['cache', 'live']),
+  updatedAt: z.number().optional(),
+  refreshState: z.enum(['idle', 'refreshing', 'error', 'unavailable']),
+})
+
+export const sidebarQuotaSnapshot = z.object({
+  accounts: z.array(
+    accountRow.extend({
+      gemini: sidebarQuotaCell,
+      nonGemini: sidebarQuotaCell,
+    }),
+  ),
+  notices: z.array(z.string()),
+})
+
+export type SidebarQuotaSnapshot = z.infer<typeof sidebarQuotaSnapshot>
+export type SidebarQuotaAccount = SidebarQuotaSnapshot['accounts'][number]
+export type SidebarQuotaCell = SidebarQuotaAccount['gemini']
+
 export const panelSnapshot = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('account'), accounts: z.array(accountRow) }),
   z.object({ kind: z.literal('quota'), accounts: z.array(accountRow) }),
@@ -43,6 +63,10 @@ export const panelSnapshot = z.discriminatedUnion('kind', [
 export const antigravityRpc = {
   id: 'cortexkit.antigravity-auth',
   methods: {
+    sidebarQuota: {
+      input: z.object({ mode: z.enum(['cache', 'ensure']) }),
+      output: sidebarQuotaSnapshot,
+    },
     run: {
       input: z.object({
         name: z.enum(['account', 'quota', 'status']),

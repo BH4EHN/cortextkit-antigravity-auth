@@ -723,6 +723,47 @@ describe('antigravity-quota refresh write-back', () => {
     expect(fixtures.quotaFetches()).toBe(1)
   })
 
+  test('summary error retains the old groups while another account updates', async () => {
+    const fixtures = createFixtures({
+      storage: singleStorage([
+        storageAccount('token-a', {
+          cachedQuota: { gemini: { remainingFraction: 0.25, modelCount: 1 } },
+          cachedQuotaAccountId: quotaAccountIdentity('token-a'),
+          cachedQuotaUpdatedAt: 123,
+        }),
+        storageAccount('token-b'),
+      ]),
+      snapshot: [storageAccount('token-a'), storageAccount('token-b')],
+      results: [
+        {
+          index: 0,
+          status: 'ok',
+          quota: {
+            groups: { gemini: { remainingFraction: 0.99, modelCount: 1 } },
+            modelCount: 1,
+            error: 'upstream unavailable',
+          },
+        },
+        {
+          index: 1,
+          status: 'ok',
+          quota: {
+            groups: {
+              'non-gemini': { remainingFraction: 0.75, modelCount: 1 },
+            },
+            modelCount: 1,
+          },
+        },
+      ],
+    })
+    await execute(commandMap(fixtures.runtime)['antigravity-quota']!, 'refresh')
+    const [a, b] = fixtures.storage().accounts
+    expect(a?.cachedQuota?.gemini?.remainingFraction).toBe(0.25)
+    expect(a?.cachedQuotaUpdatedAt).toBe(FIXED_NOW)
+    expect(b?.cachedQuota?.['non-gemini']?.remainingFraction).toBe(0.75)
+    expect(fixtures.outputs.at(-1)?.text).toContain('Refresh failures')
+  })
+
   test('cache view performs zero quota fetches', async () => {
     const fixtures = createFixtures({
       storage: singleStorage([storageAccount('token-a')]),

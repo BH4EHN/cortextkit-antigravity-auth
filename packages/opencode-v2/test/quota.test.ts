@@ -206,6 +206,35 @@ describe('makeFetchAccountQuota', () => {
     expect(result.status).toBe('error')
     expect(result.error).toContain('refresh rejected')
   })
+
+  test('uses the live credential resolver and does not independently refresh tokens', async () => {
+    stubFetch((url) =>
+      url.includes(':retrieveUserQuotaSummary')
+        ? jsonResponse(SUMMARY_BODY)
+        : jsonResponse(CLI_BODY),
+    )
+    let refreshCalls = 0
+    const fetchAccountQuota = makeFetchAccountQuota({
+      ...fakeDeps(),
+      refreshAntigravityToken: async () => {
+        refreshCalls += 1
+        throw new Error('unexpected independent refresh')
+      },
+      resolveAccess: async () => ({
+        type: 'oauth',
+        refresh: 'current-token|project|managed-project',
+        access: 'current-access',
+        expires: Date.now() + 120_000,
+      }),
+    })
+    const result = await fetchAccountQuota(
+      metadataAccount(),
+      new AbortController().signal,
+    )
+    expect(result.status).toBe('ok')
+    expect(result.updatedAccount?.refreshToken).toBe('current-token')
+    expect(refreshCalls).toBe(0)
+  })
 })
 
 describe('refreshQuotaOnce', () => {

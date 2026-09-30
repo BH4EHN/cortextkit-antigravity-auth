@@ -34,6 +34,7 @@ import {
   defaultAccountStorageStore,
   ensureProjectContext,
   exchangeAntigravity,
+  type FetchAccountQuota,
   fetchWithAgyCliTransport,
   formatRefreshParts,
   getModelFamily,
@@ -67,9 +68,11 @@ import {
   PoolMutationUnconfirmedError,
   parseAccountArgs,
 } from './commands.ts'
+import { ANTIGRAVITY_MODEL_IDS } from './models.ts'
 import { waitForAntigravityCode } from './oauth-callback.ts'
-import { makeFetchAccountQuota, refreshQuotaOnce } from './quota.ts'
+import { makeFetchAccountQuota } from './quota.ts'
 import { antigravityRpc } from './rpc.ts'
+import { SidebarQuotaCoordinator } from './sidebar-quota.ts'
 
 type ResolvedModel = ReturnType<typeof resolveModelForHeaderStyle>
 interface GeminiPart {
@@ -152,6 +155,7 @@ interface OpenCodeV2Dependencies {
   mutateAccountStorage: typeof mutateAccountStorage
   refreshAntigravityToken: typeof refreshAntigravityToken
   waitForAntigravityCode: typeof waitForAntigravityCode
+  fetchAccountQuota?: FetchAccountQuota
   send?: (input: SendInput) => Promise<Response>
 }
 
@@ -276,18 +280,6 @@ function log(...args: unknown[]): void {
     return
   }
 }
-
-const MODEL_IDS = new Set([
-  'gemini-3.8-flash',
-  'gemini-3.7-flash',
-  'gemini-3.6-flash',
-  'gemini-3.5-flash',
-  'gemini-3.1-pro',
-  'gemini-3.1-flash-image',
-  'claude-sonnet-4-6-thinking',
-  'claude-opus-4-6-thinking',
-  'gpt-oss-120b-medium',
-])
 
 function familyFor(modelID: string): 'claude' | 'gemini' {
   return getModelFamily(modelID) === 'claude' ? 'claude' : 'gemini'
@@ -650,6 +642,7 @@ export function createOpenCodeV2AntigravityPlugin(
       overrides.refreshAntigravityToken ?? refreshAntigravityToken,
     waitForAntigravityCode:
       overrides.waitForAntigravityCode ?? waitForAntigravityCode,
+    fetchAccountQuota: overrides.fetchAccountQuota,
     send: overrides.send,
   }
 
@@ -1710,7 +1703,11 @@ export function createOpenCodeV2AntigravityPlugin(
         await ctx.session.hook('http.request', async (event) => {
           try {
             if (event.model.providerID !== 'google') return
-            if (event.kind !== 'title' && !MODEL_IDS.has(event.model.id)) return
+            if (
+              event.kind !== 'title' &&
+              !ANTIGRAVITY_MODEL_IDS.has(event.model.id)
+            )
+              return
             const url = new URL(event.request.url)
             if (
               !/\/models\/[^:]+:(?:streamGenerateContent|generateContent)/.test(
@@ -1863,9 +1860,22 @@ export function createOpenCodeV2AntigravityPlugin(
       >()
       let addInFlight = false
 
-      const fetchAccountQuota = makeFetchAccountQuota({
-        ensureProjectContext: dependencies.ensureProjectContext,
-        refreshAntigravityToken: dependencies.refreshAntigravityToken,
+      const fetchAccountQuota =
+        dependencies.fetchAccountQuota ??
+        makeFetchAccountQuota({
+          ensureProjectContext: dependencies.ensureProjectContext,
+          refreshAntigravityToken: dependencies.refreshAntigravityToken,
+          resolveAccess: async (token, signal) => {
+            await waitForPool(signal)
+            return (await accessFor(token))?.auth ?? null
+          },
+        })
+      const sidebarQuota = new SidebarQuotaCoordinator({
+        accounts: () => manager.getAccounts(),
+        active: () => manager.getActiveIndexByFamily(),
+        logicalToken,
+        fetch: fetchAccountQuota,
+        now: () => Date.now(),
       })
 
       const commandRuntime: AntigravityCommandRuntime = {
@@ -1885,7 +1895,8 @@ export function createOpenCodeV2AntigravityPlugin(
         },
         fetchPoolQuota: async () => {
           const snapshot = manager.getAccountsForQuotaCheck()
-          const results = await refreshQuotaOnce(snapshot, fetchAccountQuota)
+          sidebarQuota.snapshot('cache')
+          const results = await sidebarQuota.refreshAll(snapshot)
           return { snapshot, results }
         },
         oauthAdd: loginViaCommand,
@@ -1915,6 +1926,23 @@ export function createOpenCodeV2AntigravityPlugin(
       )
       registrations.push(
         await ctx.rpc.register(antigravityRpc, {
+          sidebarQuota: async ({ mode }) => {
+            if (poolReloadRequired) {
+              const snapshot = sidebarQuota.snapshot('cache')
+              snapshot.notices.push(
+                'The Antigravity account pool requires an OpenCode restart.',
+              )
+              return snapshot
+            }
+            if (poolTransitioning) {
+              const snapshot = sidebarQuota.snapshot('cache')
+              snapshot.notices.push(
+                'The Antigravity account pool is changing; quota refresh will resume shortly.',
+              )
+              return snapshot
+            }
+            return sidebarQuota.snapshot(mode)
+          },
           run: async ({ name, args }) => {
             if (poolReloadRequired) {
               return {
@@ -2087,6 +2115,7 @@ export function createOpenCodeV2AntigravityPlugin(
       )
 
       return async () => {
+        await sidebarQuota.dispose()
         for (const registration of registrations.reverse()) {
           await registration
             .dispose()

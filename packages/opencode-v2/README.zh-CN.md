@@ -42,8 +42,13 @@ OpenCode 2.x                          本插件                        Antigravi
 可以正常流式读取与取消的 SSE 响应。
 
 `oc-plugin` 清单同时启用 server 与 TUI 入口。server 负责 provider 请求和账号操作；
-TUI 注册三个 `/antigravity-*` 命令、独立会话面板和首页插件页面。`/rpc` 定义两者之间的
-类型化通信接口。
+TUI 注册三个 `/antigravity-*` 命令、独立会话面板、首页插件页面，以及 OpenCode 原生会话
+右侧栏中的额度视图。只有选中已提交的 Google Antigravity 模型时才显示该视图；它展示所有账号
+的 Gemini 与 Claude/其他额度，并突出当前模型对应的额度组。视图先读缓存，并执行一次初始实时
+校验，即使持久化时间戳看起来仍新鲜；只有成功刷新才会建立五分钟的新鲜期。激活期间每 15 秒
+轮询。自动查询结果只保存在 server 进程内存中；手动执行
+`/antigravity-quota refresh` 仍会把成功结果写入账号池。隐藏宿主侧边栏时，此视图也会隐藏。
+`/rpc` 定义 TUI 与 server 之间的类型化通信接口。
 
 ## 安装
 

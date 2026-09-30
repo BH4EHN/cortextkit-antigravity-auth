@@ -223,6 +223,16 @@ The adapter registers three slash commands (`/antigravity-account`, `/antigravit
 
 The `oc-plugin` manifest enables both server and TUI entries. The package root and `./tui` and `./rpc` exports support OpenCode 2 host resolution.
 
+The OpenCode 2 TUI also appends a quota component to the native `sidebar.content` session slot.
+It follows the committed session model and only mounts its data view for a recognized Antigravity
+model. While mounted, it requests the in-memory cache first and performs initial live validation
+even when a persisted timestamp appears fresh. Only successful refreshes establish the five-minute
+freshness window; the TUI polls every 15 seconds and the server owns shared process-memory refresh
+state. It displays every account's Gemini and Claude/other quota groups,
+highlights the selected model's group, and uses the host's native sidebar visibility. This
+automatic view does not write quota results to the account pool: explicit
+`/antigravity-quota refresh` continues to perform the persistent manual refresh.
+
 ## OpenTUI process and trust boundary
 
 ### Two halves of the contract

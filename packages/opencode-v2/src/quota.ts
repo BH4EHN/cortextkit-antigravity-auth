@@ -39,6 +39,10 @@ import {
 export interface V2QuotaDependencies {
   ensureProjectContext: typeof ensureProjectContext
   refreshAntigravityToken: typeof refreshAntigravityToken
+  resolveAccess?: (
+    refreshToken: string,
+    signal: AbortSignal,
+  ) => Promise<OAuthAuthDetails | null>
 }
 
 async function fetchLegacyModelsFallback(options: {
@@ -95,18 +99,26 @@ export function makeFetchAccountQuota(
     }
 
     try {
-      // `getAccountsForQuotaCheck` never carries an access token, so this
-      // path always refreshes first — matching the v1 standalone contract.
-      const refreshed = await deps.refreshAntigravityToken(account.refreshToken)
-      let auth: OAuthAuthDetails = {
+      // Production uses the live adapter's credential resolver so refresh
+      // rotation follows its fenced pool mutation path. Standalone callers
+      // retain the original direct-refresh contract.
+      const authFromResolver = deps.resolveAccess
+        ? await deps.resolveAccess(account.refreshToken, signal)
+        : null
+      if (deps.resolveAccess && !authFromResolver)
+        throw new Error('Account access is unavailable')
+      const refreshed = authFromResolver
+        ? undefined
+        : await deps.refreshAntigravityToken(account.refreshToken)
+      let auth: OAuthAuthDetails = authFromResolver ?? {
         type: 'oauth',
         refresh: formatRefreshParts({
-          refreshToken: refreshed.refresh || account.refreshToken,
+          refreshToken: refreshed?.refresh || account.refreshToken,
           projectId: account.projectId,
           managedProjectId: account.managedProjectId,
         }),
-        access: refreshed.access,
-        expires: refreshed.expires,
+        access: refreshed?.access,
+        expires: refreshed?.expires,
       }
 
       const projectContext = await deps.ensureProjectContext(auth)

@@ -1,11 +1,19 @@
 import type { Definition } from '@opencode-ai/plugin/tui/plugin'
-import { createRoot, createSignal, For, Show } from 'solid-js'
+import {
+  createEffect,
+  createRoot,
+  createSignal,
+  For,
+  onCleanup,
+  Show,
+} from 'solid-js'
 import type {
   AntigravityPanelSnapshot,
   PanelAccountRow,
   PanelQuotaCell,
 } from './commands.ts'
-
+import { isAntigravityModel, quotaGroupForAntigravityModel } from './models.ts'
+import type { SidebarQuotaSnapshot } from './rpc.ts'
 import { antigravityRpc } from './rpc.ts'
 
 type View = 'account' | 'quota' | 'status'
@@ -23,6 +31,7 @@ export const tui = {
       const [busy, setBusy] = createSignal(false)
       const [operationId, setOperationId] = createSignal<string>()
       const rpc = ctx.client.rpc(antigravityRpc)
+      const sessionData = ctx.data
       let sequence = 0
       let timer: ReturnType<typeof setInterval> | undefined
 
@@ -268,6 +277,251 @@ export const tui = {
         )
       }
 
+      function SidebarQuotaCell(props: {
+        label: string
+        cell: SidebarQuotaSnapshot['accounts'][number]['gemini']
+        selected: boolean
+      }) {
+        const value = () => props.cell.remainingPercent
+        const color = () =>
+          props.selected ? theme().accent : theme().textMuted
+        const state = () =>
+          props.cell.refreshState === 'refreshing'
+            ? ' · refreshing'
+            : props.cell.refreshState === 'error'
+              ? ' · refresh failed'
+              : props.cell.refreshState === 'unavailable'
+                ? ' · unavailable'
+                : ''
+        return (
+          <box flexDirection='column'>
+            <text fg={color()}>
+              {props.selected ? '› ' : '  '}
+              {props.label}: {value() === null ? '—' : `${value()}%`}
+              {state()}
+            </text>
+            <For each={props.cell.windows}>
+              {(window) => (
+                <text fg={theme().textMuted}>
+                  {'    '}
+                  {window.name === 'weekly' ? 'Weekly' : '5h'}{' '}
+                  {window.remainingPercent === null
+                    ? '—'
+                    : `${window.remainingPercent}%`}
+                  {window.resetAt !== undefined
+                    ? ` · ${relative(window.resetAt - Date.now())}`
+                    : ''}
+                </text>
+              )}
+            </For>
+            <text fg={theme().textMuted}>
+              {'    '}
+              {props.cell.source === 'live' ? 'Live' : 'Cached'}
+              {props.cell.updatedAt !== undefined
+                ? ` ${relative(Date.now() - props.cell.updatedAt)} ago`
+                : ''}
+            </text>
+          </box>
+        )
+      }
+
+      function Sidebar(props: { sessionID: string }) {
+        const [model, setModel] = createSignal<
+          { providerID: string; id: string } | undefined
+        >()
+        const [data, setData] = createSignal<SidebarQuotaSnapshot>()
+        const [notice, setNotice] = createSignal<string>()
+        const [sessionNotice, setSessionNotice] = createSignal<string>()
+        let active = false
+        let generation = 0
+        let requestInFlight: number | undefined
+        let timer: ReturnType<typeof setInterval> | undefined
+
+        function stop() {
+          if (timer) clearInterval(timer)
+          timer = undefined
+        }
+
+        function readModel(sessionID: string) {
+          const selected = sessionData.session.get(sessionID)?.model
+          const candidate = selected as
+            | { providerID?: string; id?: string }
+            | undefined
+          setModel(
+            candidate?.providerID && candidate.id
+              ? { providerID: candidate.providerID, id: candidate.id }
+              : undefined,
+          )
+        }
+
+        function selectFromEvent(event: unknown, sessionID: string) {
+          const value = event as {
+            data?: {
+              sessionID?: string
+              model?: { providerID?: string; id?: string }
+            }
+          }
+          if (value.data?.sessionID !== sessionID) return
+          const selected = value.data.model
+          if (selected?.providerID && selected.id)
+            setModel({ providerID: selected.providerID, id: selected.id })
+          else readModel(sessionID)
+          setSessionNotice(undefined)
+        }
+
+        async function request(mode: 'cache' | 'ensure', current: number) {
+          if (requestInFlight === current) return
+          requestInFlight = current
+          try {
+            const result = await rpc.sidebarQuota({ mode })
+            if (current !== generation || !active) return
+            setData(result)
+            setNotice(result.notices[0])
+          } catch {
+            if (current !== generation || !active) return
+            setNotice(
+              'Quota refresh failed. Showing the last available values.',
+            )
+          } finally {
+            if (requestInFlight === current) requestInFlight = undefined
+          }
+        }
+
+        async function load(current: number) {
+          await request('cache', current)
+          if (current === generation && active) await request('ensure', current)
+        }
+
+        function activate() {
+          if (active) return
+          active = true
+          const current = ++generation
+          void load(current)
+          timer = setInterval(() => {
+            void request('ensure', current)
+          }, 15_000)
+        }
+
+        function deactivate() {
+          if (!active) return
+          active = false
+          generation++
+          stop()
+        }
+
+        createEffect(() => {
+          const selected = model()
+          if (isAntigravityModel(selected)) activate()
+          else deactivate()
+        })
+
+        createEffect(() => {
+          const sessionID = props.sessionID
+          generation++
+          active = false
+          stop()
+          setModel(undefined)
+          setData(undefined)
+          setNotice(undefined)
+          setSessionNotice(undefined)
+          const unsubscribe = sessionData.on(
+            'session.model.selected',
+            (event) => selectFromEvent(event, sessionID),
+          )
+          onCleanup(() => {
+            generation++
+            active = false
+            stop()
+            unsubscribe()
+          })
+          readModel(sessionID)
+          void sessionData.session
+            .sync(sessionID)
+            .then(() => {
+              if (props.sessionID === sessionID) {
+                readModel(sessionID)
+                setSessionNotice(undefined)
+              }
+            })
+            .catch(() => {
+              if (props.sessionID === sessionID)
+                setSessionNotice(
+                  'Could not load the selected session model yet.',
+                )
+            })
+        })
+
+        const group = () => quotaGroupForAntigravityModel(model())
+        return (
+          <Show when={group()}>
+            {(selectedGroup) => (
+              <box flexDirection='column' paddingX={1} paddingY={1}>
+                <text fg={theme().accent}>Antigravity quota</text>
+                <text fg={theme().textMuted}>
+                  All accounts · automatic updates while this model is selected
+                </text>
+                <Show
+                  when={data() && data()!.accounts.length > 0}
+                  fallback={
+                    <text fg={theme().textMuted}>
+                      {data() ? 'No Antigravity accounts' : 'Loading quota…'}
+                    </text>
+                  }
+                >
+                  <For each={data()?.accounts ?? []}>
+                    {(account) => (
+                      <box
+                        flexDirection='column'
+                        marginTop={1}
+                        paddingX={1}
+                        border
+                        borderStyle='single'
+                        borderColor={theme().borderSubtle}
+                      >
+                        <box flexDirection='row'>
+                          <text fg={theme().text}>{account.label}</text>
+                          <text
+                            fg={
+                              account.state === 'active'
+                                ? theme().success
+                                : theme().warning
+                            }
+                          >
+                            {'  '}
+                            {account.state === 'verification-required'
+                              ? 'VERIFY'
+                              : account.state.toUpperCase()}
+                          </text>
+                          <Show when={account.current !== 'none'}>
+                            <text fg={theme().success}> Default</text>
+                          </Show>
+                        </box>
+                        <SidebarQuotaCell
+                          label='Gemini'
+                          cell={account.gemini}
+                          selected={selectedGroup() === 'gemini'}
+                        />
+                        <SidebarQuotaCell
+                          label='Claude / other'
+                          cell={account.nonGemini}
+                          selected={selectedGroup() === 'non-gemini'}
+                        />
+                      </box>
+                    )}
+                  </For>
+                </Show>
+                <Show when={notice()}>
+                  {(value) => <text fg={theme().warning}>{value()}</text>}
+                </Show>
+                <Show when={sessionNotice()}>
+                  {(value) => <text fg={theme().warning}>{value()}</text>}
+                </Show>
+              </box>
+            )}
+          </Show>
+        )
+      }
+
       function Content() {
         const accounts = () => {
           const current = snapshot()
@@ -347,6 +601,10 @@ export const tui = {
         append: 'session.panel',
         render: (input) => (input.name === PANEL ? <Content /> : null),
       })
+      const offSidebar = ctx.ui.slot({
+        append: 'sidebar.content',
+        render: (input) => <Sidebar sessionID={input.sessionID} />,
+      })
       const offCommands = ctx.ui.slot({
         append: 'app',
         render: () => {
@@ -410,6 +668,7 @@ export const tui = {
         stopPolling()
         offCommands()
         offPanel()
+        offSidebar()
         offPage()
         dispose()
       }

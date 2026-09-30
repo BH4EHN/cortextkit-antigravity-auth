@@ -811,10 +811,10 @@ export function createAntigravityCommands(
       updates.push({
         token,
         groups:
-          result.status === 'ok' && result.quota?.groups
+          result.status === 'ok' && result.quota?.groups && !result.quota.error
             ? result.quota.groups
             : undefined,
-        error: result.status === 'error' ? result.error : undefined,
+        error: result.status === 'error' ? result.error : result.quota?.error,
       })
     }
 

@@ -46,8 +46,16 @@ plain SSE response it can stream and cancel.
 
 The `oc-plugin` manifest enables both server and TUI entries. The server handles provider
 requests and account operations; the TUI entry registers the three `/antigravity-*` commands,
-an independent session panel, and a home page. The `/rpc` entry defines the typed channel
-between them.
+an independent session panel, a home page, and a quota view in OpenCode's native session
+right sidebar. The sidebar appears only while a committed Google Antigravity model is selected;
+it shows Gemini and Claude/other quota for every account and highlights the selected model's
+quota family. It reads cached values first and performs an initial live validation even when a
+persisted timestamp appears fresh. Only a successful refresh establishes the five-minute
+freshness window; the sidebar then polls while active (15 seconds). Automatic results live in
+server process memory; `/antigravity-quota refresh` remains the manual refresh that writes
+successful results to the account pool. Hiding
+the host sidebar also hides this contribution. The `/rpc` entry defines the typed channel
+between the TUI and server.
 
 ## Install
 
