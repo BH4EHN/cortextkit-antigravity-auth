@@ -1,4 +1,5 @@
 import type { Definition } from '@opencode-ai/plugin/tui/plugin'
+import { TextAttributes } from '@opentui/core'
 import {
   createEffect,
   createRoot,
@@ -118,21 +119,31 @@ export const tui = {
         void run(name, args)
       }
 
-      type ThemeColors = {
-        text?: string
-        textMuted?: string
-        accent?: string
-        success?: string
-        warning?: string
-        error?: string
-        borderSubtle?: string
-      }
-      const hostTheme = (
-        ctx as unknown as {
-          theme?: { current?: ThemeColors }
+      type ThemeColors = Partial<
+        Record<
+          | 'text'
+          | 'textMuted'
+          | 'accent'
+          | 'success'
+          | 'warning'
+          | 'error'
+          | 'borderSubtle',
+          typeof ctx.theme.text.base | undefined
+        >
+      >
+      const theme = (): ThemeColors => {
+        const text = ctx.theme.text
+        const base = text?.base
+        return {
+          text: base,
+          textMuted: text?.muted ?? base,
+          accent: text?.action?.primary?.selected ?? base,
+          success: text?.feedback?.success?.base ?? base,
+          warning: text?.feedback?.warning?.base ?? base,
+          error: text?.feedback?.error?.base ?? base,
+          borderSubtle: ctx.theme.border?.base,
         }
-      ).theme
-      const theme = (): ThemeColors => hostTheme?.current ?? {}
+      }
 
       function QuotaCell(props: { label: string; cell: PanelQuotaCell }) {
         const percentage = () => props.cell.remainingPercent
@@ -283,44 +294,101 @@ export const tui = {
         selected: boolean
       }) {
         const value = () => props.cell.remainingPercent
-        const color = () =>
-          props.selected ? theme().accent : theme().textMuted
+        const severityColor = (percentage = value()) => {
+          if (percentage === null) return theme().textMuted
+          if (percentage < 10)
+            return theme().error ?? theme().accent ?? theme().text
+          if (percentage < 20)
+            return theme().warning ?? theme().accent ?? theme().text
+          return theme().success ?? theme().accent ?? theme().text
+        }
+        const filledCells = () => {
+          const percentage = value()
+          if (percentage === null || percentage <= 0) return 0
+          if (percentage >= 100) return 8
+          const filled = Math.max(
+            1,
+            Math.min(7, Math.round((percentage * 8) / 100)),
+          )
+          return filled
+        }
+        const warning = () => {
+          const percentage = value()
+          if (percentage === null) return ''
+          if (percentage <= 0) return ' ▲ Empty'
+          if (percentage < 20) return ' ▲ Low'
+          return ''
+        }
         const state = () =>
           props.cell.refreshState === 'refreshing'
-            ? ' · refreshing'
+            ? ' · refresh'
             : props.cell.refreshState === 'error'
-              ? ' · refresh failed'
+              ? ' · failed'
               : props.cell.refreshState === 'unavailable'
-                ? ' · unavailable'
+                ? ' · N/A'
                 : ''
         return (
           <box flexDirection='column'>
-            <text fg={color()}>
-              {props.selected ? '› ' : '  '}
-              {props.label}: {value() === null ? '—' : `${value()}%`}
-              {state()}
-            </text>
+            <box flexDirection='row'>
+              <text
+                width={
+                  props.selected
+                    ? props.label.length + 2
+                    : props.label.length + 1
+                }
+                flexShrink={0}
+                fg={props.selected ? theme().accent : theme().textMuted}
+                attributes={props.selected ? TextAttributes.BOLD : 0}
+              >
+                {props.selected ? '› ' : ' '}
+                {props.label}
+              </text>
+              <text fg={severityColor()}>
+                {': '}
+                {value() === null ? '—' : `${value()}%`}
+                {warning()}
+              </text>
+            </box>
+            <box flexDirection='row'>
+              <box width={8} flexShrink={0} flexDirection='row'>
+                <text fg={severityColor()}>
+                  {value() === null ? '' : '█'.repeat(filledCells())}
+                </text>
+                <text fg={theme().textMuted}>
+                  {value() === null
+                    ? '────────'
+                    : '░'.repeat(8 - filledCells())}
+                </text>
+              </box>
+              <text fg={theme().textMuted}>
+                {' '}
+                {props.cell.source === 'live' ? 'Live' : 'Cached'}
+                {props.cell.updatedAt !== undefined
+                  ? ` ${relative(Date.now() - props.cell.updatedAt)}`
+                  : ''}
+                {state()}
+              </text>
+            </box>
             <For each={props.cell.windows}>
               {(window) => (
-                <text fg={theme().textMuted}>
-                  {'    '}
-                  {window.name === 'weekly' ? 'Weekly' : '5h'}{' '}
-                  {window.remainingPercent === null
-                    ? '—'
-                    : `${window.remainingPercent}%`}
-                  {window.resetAt !== undefined
-                    ? ` · ${relative(window.resetAt - Date.now())}`
-                    : ''}
-                </text>
+                <box flexDirection='row'>
+                  <text fg={theme().textMuted}>
+                    {'    '}
+                    {window.name === 'weekly' ? 'Weekly' : '5h'}{' '}
+                  </text>
+                  <text fg={severityColor(window.remainingPercent)}>
+                    {window.remainingPercent === null
+                      ? '—'
+                      : `${window.remainingPercent}%`}
+                  </text>
+                  <text fg={theme().textMuted}>
+                    {window.resetAt !== undefined
+                      ? ` · ${relative(window.resetAt - Date.now())}`
+                      : ''}
+                  </text>
+                </box>
               )}
             </For>
-            <text fg={theme().textMuted}>
-              {'    '}
-              {props.cell.source === 'live' ? 'Live' : 'Cached'}
-              {props.cell.updatedAt !== undefined
-                ? ` ${relative(Date.now() - props.cell.updatedAt)} ago`
-                : ''}
-            </text>
           </box>
         )
       }
@@ -455,10 +523,14 @@ export const tui = {
         return (
           <Show when={group()}>
             {(selectedGroup) => (
-              <box flexDirection='column' paddingX={1} paddingY={1}>
+              <box flexDirection='column' paddingY={1}>
                 <text fg={theme().accent}>Antigravity quota</text>
                 <text fg={theme().textMuted}>
-                  All accounts · automatic updates while this model is selected
+                  {data()
+                    ? `${data()!.accounts.length} ${data()!.accounts.length === 1 ? 'account' : 'accounts'}`
+                    : 'Loading quota…'}
+                  {' · '}
+                  {selectedGroup() === 'gemini' ? 'Gemini' : 'Claude/other'}
                 </text>
                 <Show
                   when={data() && data()!.accounts.length > 0}
@@ -473,7 +545,6 @@ export const tui = {
                       <box
                         flexDirection='column'
                         marginTop={1}
-                        paddingX={1}
                         border
                         borderStyle='single'
                         borderColor={theme().borderSubtle}
@@ -502,7 +573,7 @@ export const tui = {
                           selected={selectedGroup() === 'gemini'}
                         />
                         <SidebarQuotaCell
-                          label='Claude / other'
+                          label='Claude/other'
                           cell={account.nonGemini}
                           selected={selectedGroup() === 'non-gemini'}
                         />

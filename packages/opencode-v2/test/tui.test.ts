@@ -1,4 +1,5 @@
 import { describe, expect, jest, test } from 'bun:test'
+import { RGBA, TextAttributes } from '@opentui/core'
 import { testRender } from '@opentui/solid'
 import { createSignal } from 'solid-js'
 import type { SidebarQuotaSnapshot } from '../src/rpc.ts'
@@ -32,6 +33,7 @@ function setup(
       | ((input: { mode: 'cache' | 'ensure' }) => Promise<SidebarQuotaSnapshot>)
   } = {},
   dataOptions: { syncSession?: () => Promise<void> } = {},
+  themeOverride?: unknown,
 ) {
   let currentRoute = route
   const layers: Array<() => Layer> = []
@@ -120,16 +122,18 @@ function setup(
         return () => listeners.delete(handler)
       },
     },
-    theme: {
-      current: {
-        text: '#eeeeee',
-        textMuted: '#888888',
-        accent: '#5555ff',
-        success: '#00ff00',
-        warning: '#ffff00',
-        error: '#ff0000',
-        borderSubtle: '#444444',
+    theme: themeOverride ?? {
+      text: {
+        base: RGBA.fromInts(238, 238, 238),
+        muted: RGBA.fromInts(128, 128, 128),
+        action: { primary: { selected: RGBA.fromInts(250, 178, 131) } },
+        feedback: {
+          success: { base: RGBA.fromInts(127, 216, 143) },
+          warning: { base: RGBA.fromInts(245, 167, 66) },
+          error: { base: RGBA.fromInts(224, 108, 117) },
+        },
       },
+      border: { base: RGBA.fromInts(72, 72, 72) },
     },
   }
   const cleanup = tui.setup(ctx as never)
@@ -704,6 +708,146 @@ describe('OpenCode 2 TUI slash commands', () => {
 })
 
 describe('OpenCode 2 quota sidebar', () => {
+  test('falls back to base text color when semantic theme colors are absent', async () => {
+    const snapshot = sidebarSnapshot(20)
+    const baseColor = RGBA.fromInts(238, 238, 238)
+    const mutedColor = RGBA.fromInts(128, 128, 128)
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-theme-fallback' },
+      { sidebarQuota: snapshot },
+      {},
+      { text: { base: baseColor, muted: mutedColor }, border: {} },
+    )
+    mounted.selectModel('session-theme-fallback', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () =>
+        mounted.renderSidebar!({
+          sessionID: 'session-theme-fallback',
+        }) as never,
+      { width: 60, height: 24 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const spans = rendered.captureSpans().lines.flatMap((line) => line.spans)
+      const find = (text: string) => spans.find((span) => span.text === text)!
+      expect(find('› Gemini').fg.toInts()).toEqual([238, 238, 238, 255])
+      expect(find(': 20%').fg.toInts()).toEqual([238, 238, 238, 255])
+      expect(
+        spans.find((span) => span.text.includes('5h'))!.fg.toInts(),
+      ).toEqual([128, 128, 128, 255])
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('keeps severity, exact percentages, and selected styling across boundaries', async () => {
+    const snapshot = sidebarSnapshot(0)
+    const cells = [
+      [0, 1],
+      [9, 10],
+      [19, 20],
+      [100, null],
+    ] as const
+    snapshot.accounts = cells.map(([gemini, claude], index) => {
+      const base = snapshot.accounts[index % snapshot.accounts.length]!
+      const refreshState = ['refreshing', 'error', 'unavailable', 'idle'][
+        index
+      ]!
+      return {
+        ...base,
+        label: `Boundary ${index + 1}`,
+        gemini: {
+          ...base.gemini,
+          remainingPercent: gemini,
+          refreshState: refreshState as
+            | 'refreshing'
+            | 'error'
+            | 'unavailable'
+            | 'idle',
+        },
+        nonGemini: {
+          ...base.nonGemini,
+          remainingPercent: claude,
+          refreshState: refreshState as
+            | 'refreshing'
+            | 'error'
+            | 'unavailable'
+            | 'idle',
+        },
+      }
+    })
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-boundaries' },
+      { sidebarQuota: snapshot },
+    )
+    mounted.selectModel('session-boundaries', {
+      providerID: 'google',
+      id: 'claude-opus-4-6-thinking',
+    })
+    const rendered = await testRender(
+      () =>
+        mounted.renderSidebar!({ sessionID: 'session-boundaries' }) as never,
+      { width: 32, height: 52 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const frame = rendered.captureCharFrame()
+      for (const expected of [
+        'Gemini: 0% ▲ Empty',
+        'Claude/other: 1% ▲ Low',
+        'Gemini: 9% ▲ Low',
+        'Claude/other: 10% ▲ Low',
+        'Gemini: 19% ▲ Low',
+        'Claude/other: 20%',
+        'Gemini: 100%',
+        'Claude/other: —',
+      ])
+        expect(frame).toContain(expected)
+      expect(frame).toContain('refresh')
+      expect(frame).toContain('failed')
+      expect(frame).toContain('N/A')
+
+      const spans = rendered.captureSpans()
+      const textSpans = spans.lines.flatMap((line) => line.spans)
+      const windowRow = spans.lines.find((line) =>
+        line.spans.some((span) => span.text === '    5h '),
+      )!.spans
+      expect(windowRow.find((span) => span.text === '0%')!.fg.toInts()).toEqual(
+        [224, 108, 117, 255],
+      )
+      expect(
+        windowRow.find((span) => span.text.includes(' · 59m'))!.fg.toInts(),
+      ).toEqual([128, 128, 128, 255])
+      const find = (value: string) =>
+        textSpans.find((span) => span.text.includes(value))!
+      const rgb = (value: string) => find(value).fg.toInts()
+      expect(rgb('› Claude/other')).toEqual([250, 178, 131, 255])
+      expect(find('› Claude/other').attributes).toBe(TextAttributes.BOLD)
+      expect(rgb(': 1% ▲ Low')).toEqual([224, 108, 117, 255])
+      expect(rgb(': 9% ▲ Low')).toEqual([224, 108, 117, 255])
+      expect(rgb(': 10% ▲ Low')).toEqual([245, 167, 66, 255])
+      expect(rgb(': 19% ▲ Low')).toEqual([245, 167, 66, 255])
+      expect(rgb(': 20%')).toEqual([127, 216, 143, 255])
+      expect(rgb(': 0% ▲ Empty')).toEqual([224, 108, 117, 255])
+      expect(rgb('█')).toEqual([224, 108, 117, 255])
+      expect(rgb('░░░░░░░░')).toEqual([128, 128, 128, 255])
+      expect(rgb('████████')).toEqual([127, 216, 143, 255])
+      expect(rgb('──────── Cached')).toEqual([128, 128, 128, 255])
+      expect(frame.indexOf('Gemini: 0%')).toBeLessThan(
+        frame.indexOf('Claude/other: 1%'),
+      )
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
   test('renders all-account quota groups and follows committed model changes', async () => {
     const mounted = setup(
       { type: 'session', sessionID: 'session-1' },
@@ -728,10 +872,11 @@ describe('OpenCode 2 quota sidebar', () => {
       await rendered.flush()
       let frame = rendered.captureCharFrame()
       expect(frame).toContain('Antigravity quota')
+      expect(frame).toContain('2 accounts · Gemini')
       expect(frame).toContain('Default account')
       expect(frame).toContain('Disabled account')
       expect(frame).toContain('Gemini: 63%')
-      expect(frame).toContain('Claude / other: 0%')
+      expect(frame).toContain('Claude/other: 0%')
       expect(frame).toContain('Gemini: —')
       expect(frame).toContain('Weekly 14%')
       expect(frame).toContain('Default')
@@ -742,7 +887,8 @@ describe('OpenCode 2 quota sidebar', () => {
         id: 'claude-sonnet-4-6-thinking',
       })
       await rendered.flush()
-      expect(rendered.captureCharFrame()).toContain('Claude / other: 0%')
+      expect(rendered.captureCharFrame()).toContain('Claude/other: 0%')
+      expect(rendered.captureCharFrame()).toContain('2 accounts · Claude/other')
       expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
 
       mounted.selectModel('session-1', {
@@ -836,7 +982,7 @@ describe('OpenCode 2 quota sidebar', () => {
       await rendered.flush()
       const frame = rendered.captureCharFrame()
       expect(frame).toContain('Gemini: 27%')
-      expect(frame).toContain('Cached 1m ago')
+      expect(frame).toContain('Cached 1m')
       expect(frame).toContain('Quota refresh failed')
       expect(frame).not.toContain('sensitive transport detail')
     } finally {

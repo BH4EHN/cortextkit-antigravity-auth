@@ -11,7 +11,6 @@ import {
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-
 import { Host } from '@opencode-ai/plugin/host'
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), '../../../../')
@@ -70,6 +69,14 @@ async function verifyInstalledTui(
   consumerDir: string,
   tuiEntry: string,
 ): Promise<void> {
+  const corePath = Bun.resolveSync(
+    '@opentui/core',
+    join(consumerDir, 'package.json'),
+  )
+  const core = (await import(pathToFileURL(corePath).href)) as {
+    RGBA: { fromInts(r: number, g: number, b: number, a?: number): unknown }
+  }
+  const color = (r: number, g: number, b: number) => core.RGBA.fromInts(r, g, b)
   const solid = (await import(
     pathToFileURL(join(consumerDir, 'node_modules/@opentui/solid/index.bun.js'))
       .href
@@ -160,15 +167,17 @@ async function verifyInstalledTui(
       },
     },
     theme: {
-      current: {
-        text: '#eeeeee',
-        textMuted: '#888888',
-        accent: '#5555ff',
-        success: '#00ff00',
-        warning: '#ffff00',
-        error: '#ff0000',
-        borderSubtle: '#444444',
+      text: {
+        base: color(238, 238, 238),
+        muted: color(128, 128, 128),
+        action: { primary: { selected: color(250, 178, 131) } },
+        feedback: {
+          success: { base: color(127, 216, 143) },
+          warning: { base: color(245, 167, 66) },
+          error: { base: color(224, 108, 117) },
+        },
       },
+      border: { base: color(72, 72, 72) },
     },
   }
   const cleanup = setupTui(ctx as never)
@@ -388,6 +397,7 @@ async function verifyInstalledTui(
     )
     frame = await settle(sidebarRendered)
     assertContains(frame, 'Packed sidebar account', 'sidebar cache')
+    assertContains(frame, '1 account · Gemini', 'sidebar selected-group header')
     assertContains(frame, 'Gemini: 61%', 'sidebar cache')
     assertContains(frame, 'Weekly 18%', 'sidebar windows')
     resolveFresh(sidebarResult(88, 'live'))
