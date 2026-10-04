@@ -131,6 +131,81 @@ describe('deduplicateAccountsByEmail', () => {
 })
 
 describe('mergeAccountStorage', () => {
+  it('keeps quota success metadata attached to its cached snapshot', () => {
+    const existing = makeV4([
+      {
+        refreshToken: 'r1',
+        addedAt: 1,
+        lastUsed: 1,
+        cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 1 } },
+        cachedQuotaAccountId: 'snapshot-owner',
+        cachedQuotaSuccessAt: 123,
+      },
+    ])
+    const partialIncoming = makeV4([
+      {
+        refreshToken: 'r1',
+        addedAt: 1,
+        lastUsed: 2,
+        cachedQuotaUpdatedAt: 456,
+      },
+    ])
+
+    expect(
+      mergeAccountStorage(existing, partialIncoming).accounts[0],
+    ).toMatchObject({
+      cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 1 } },
+      cachedQuotaAccountId: 'snapshot-owner',
+      cachedQuotaSuccessAt: 123,
+      cachedQuotaUpdatedAt: 456,
+    })
+
+    const replacement = makeV4([
+      {
+        refreshToken: 'r1',
+        addedAt: 1,
+        lastUsed: 3,
+        cachedQuota: {},
+        cachedQuotaAccountId: 'new-owner',
+        cachedQuotaSuccessAt: 789,
+      },
+    ])
+    expect(
+      mergeAccountStorage(existing, replacement).accounts[0],
+    ).toMatchObject({
+      cachedQuota: {},
+      cachedQuotaAccountId: 'new-owner',
+      cachedQuotaSuccessAt: 789,
+    })
+
+    const replacementWithoutMarker = makeV4([
+      {
+        refreshToken: 'r1',
+        addedAt: 1,
+        lastUsed: 3,
+        cachedQuota: { gemini: { remainingFraction: 0.8, modelCount: 1 } },
+      },
+    ])
+    const unmarked = mergeAccountStorage(existing, replacementWithoutMarker)
+      .accounts[0]
+    expect(unmarked?.cachedQuota?.gemini?.remainingFraction).toBe(0.8)
+    expect(unmarked?.cachedQuotaAccountId).toBeUndefined()
+    expect(unmarked?.cachedQuotaSuccessAt).toBeUndefined()
+
+    const clear = makeV4([
+      {
+        refreshToken: 'r1',
+        addedAt: 1,
+        lastUsed: 4,
+        cachedQuota: undefined,
+      },
+    ])
+    const cleared = mergeAccountStorage(existing, clear).accounts[0]
+    expect(cleared?.cachedQuota).toBeUndefined()
+    expect(cleared?.cachedQuotaAccountId).toBeUndefined()
+    expect(cleared?.cachedQuotaSuccessAt).toBeUndefined()
+  })
+
   it('preserves a newer ineligible decision against a stale concurrent writer', () => {
     const existing = makeV4([
       {

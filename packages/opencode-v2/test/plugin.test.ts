@@ -13,6 +13,7 @@ import plugin, {
   createOpenCodeV2AntigravityPlugin,
   upsertOAuthAccount,
 } from '../src/plugin.ts'
+import { encodeRpcOutput } from './rpc-output-codec.ts'
 
 function successResponse(): Response {
   return new Response(
@@ -276,9 +277,12 @@ interface CapturedCommands {
     operationId?: string
     snapshot?: AntigravityPanelSnapshot
   }>
-  operation: (input: {
-    operationId: string
-  }) => Promise<{ state: string; messages: string[] }>
+  operation: (input: { operationId: string }) => Promise<{
+    state: string
+    messages: string[]
+    notices?: string[]
+    snapshot?: AntigravityPanelSnapshot
+  }>
   cleanup: () => Promise<void>
 }
 
@@ -1486,12 +1490,17 @@ describe('opencode-v2 slash commands', () => {
     try {
       const started = await captured.run({ name: 'account', args: 'add' })
       expect(started.operationId).toBeString()
+      expect(Object.hasOwn(started, 'snapshot')).toBe(false)
+      await expect(encodeRpcOutput(started)).resolves.toBeDefined()
       expect(started.messages.join('\n')).toContain(
         'https://accounts.example/authorize?state=cmd-state',
       )
-      expect(
-        (await captured.operation({ operationId: started.operationId! })).state,
-      ).toBe('pending')
+      const pending = await captured.operation({
+        operationId: started.operationId!,
+      })
+      expect(pending.state).toBe('pending')
+      expect(Object.hasOwn(pending, 'snapshot')).toBe(false)
+      await expect(encodeRpcOutput(pending)).resolves.toBeDefined()
       const independent = await captured.run({ name: 'quota', args: '' })
       expect(independent.messages.join('\n')).toContain('empty')
       finishCode('cmd-code')
@@ -1509,6 +1518,8 @@ describe('opencode-v2 slash commands', () => {
         })
       }
       expect(completed.state).toBe('complete')
+      expect(completed.snapshot?.kind).toBe('account')
+      await expect(encodeRpcOutput(completed)).resolves.toBeDefined()
       expect(completed.messages.join('\n')).toContain('Account added')
       expect(completed.messages.join('\n')).not.toContain('cmd-refresh')
     } finally {
@@ -1540,6 +1551,8 @@ describe('opencode-v2 slash commands', () => {
         })
       }
       expect(outcome.state).toBe('failed')
+      expect(Object.hasOwn(outcome, 'snapshot')).toBe(false)
+      await expect(encodeRpcOutput(outcome)).resolves.toBeDefined()
       expect(outcome.messages.join('\n')).toContain('login failed')
       expect(outcome.messages.join('\n')).not.toContain(
         'upstream-secret-detail',

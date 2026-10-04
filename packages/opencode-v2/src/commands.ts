@@ -53,6 +53,7 @@ export interface ProjectedAccountRow {
   gemini: ProjectedQuotaCell
   nonGemini: ProjectedQuotaCell
   updatedAt?: number
+  successAt?: number
 }
 
 export interface PanelQuotaCell {
@@ -72,6 +73,7 @@ export interface PanelAccountRow {
   gemini: PanelQuotaCell
   nonGemini: PanelQuotaCell
   cacheUpdatedAt?: number
+  cacheSuccessAt?: number
 }
 
 export type AntigravityPanelSnapshot =
@@ -297,7 +299,11 @@ export function projectRows(
     const stampValid =
       !account.cachedQuotaAccountId ||
       account.cachedQuotaAccountId === quotaAccountIdentity(token)
-    const cached = stampValid ? account.cachedQuota : undefined
+    const successStampValid =
+      account.cachedQuotaAccountId === quotaAccountIdentity(token)
+    const hasCachedQuota = account.cachedQuota !== undefined
+    const cached =
+      stampValid && hasCachedQuota ? account.cachedQuota : undefined
     const isClaude = activeByFamily.claude === index
     const isGemini = activeByFamily.gemini === index
     return {
@@ -310,19 +316,24 @@ export function projectRows(
       gemini: cellFromGroup(cached?.gemini),
       nonGemini: cellFromGroup(cached?.['non-gemini']),
       updatedAt: stampValid ? account.cachedQuotaUpdatedAt : undefined,
+      successAt:
+        successStampValid && hasCachedQuota
+          ? account.cachedQuotaSuccessAt
+          : undefined,
     }
   })
 }
 
 function panelCell(cell: ProjectedQuotaCell): PanelQuotaCell {
+  const windows = (cell.windows ?? []).map((window) => ({
+    name: window.window,
+    remainingPercent: window.percent,
+    ...(window.resetAt !== undefined ? { resetAt: window.resetAt } : {}),
+  }))
   return {
     remainingPercent: cell.percent,
-    resetAt: cell.resetAt,
-    windows: (cell.windows ?? []).map((window) => ({
-      name: window.window,
-      remainingPercent: window.percent,
-      resetAt: window.resetAt,
-    })),
+    ...(cell.resetAt !== undefined ? { resetAt: cell.resetAt } : {}),
+    windows,
   }
 }
 
@@ -342,7 +353,8 @@ export function projectPanelAccounts(
             : 'none',
     gemini: panelCell(row.gemini),
     nonGemini: panelCell(row.nonGemini),
-    cacheUpdatedAt: row.updatedAt,
+    ...(row.updatedAt !== undefined ? { cacheUpdatedAt: row.updatedAt } : {}),
+    ...(row.successAt !== undefined ? { cacheSuccessAt: row.successAt } : {}),
   }))
 }
 
@@ -836,6 +848,7 @@ export function createAntigravityCommands(
             cachedQuota: update.groups,
             cachedQuotaAccountId: quotaAccountIdentity(entry.refreshToken),
             cachedQuotaUpdatedAt: refreshedAt,
+            cachedQuotaSuccessAt: refreshedAt,
           }
         }
         // Error keeps the previous cached percentages and only records

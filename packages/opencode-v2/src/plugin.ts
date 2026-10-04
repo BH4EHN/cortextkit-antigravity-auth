@@ -2067,7 +2067,9 @@ export function createOpenCodeV2AntigravityPlugin(
                     messages: [...operation.messages],
                     notices: [...operation.notices],
                     operationId,
-                    snapshot: operation.snapshot,
+                    ...(operation.snapshot
+                      ? { snapshot: operation.snapshot }
+                      : {}),
                   }
                 : {
                     messages: [...operation.messages],
@@ -2093,7 +2095,9 @@ export function createOpenCodeV2AntigravityPlugin(
               return {
                 messages,
                 notices: [...panelOutput.notices],
-                snapshot: panelOutput.snapshot,
+                ...(panelOutput.snapshot
+                  ? { snapshot: panelOutput.snapshot }
+                  : {}),
               }
             } finally {
               commandOutputs.delete(callID)
@@ -2108,7 +2112,7 @@ export function createOpenCodeV2AntigravityPlugin(
               state: operation.state,
               messages: [...operation.messages],
               notices: [...operation.notices],
-              snapshot: operation.snapshot,
+              ...(operation.snapshot ? { snapshot: operation.snapshot } : {}),
             }
           },
         }),

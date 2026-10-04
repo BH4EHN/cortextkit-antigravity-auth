@@ -25,11 +25,20 @@ type Rendered = {
 }
 
 type TuiHandlers = {
-  sidebarQuota(input: {
-    mode: 'cache' | 'ensure'
-  }): Promise<Record<string, unknown>>
-  run(input: { name: string; args: string }): Promise<Record<string, unknown>>
-  operation(input: { operationId: string }): Promise<Record<string, unknown>>
+  sidebarQuota(
+    input: {
+      mode: 'cache' | 'ensure'
+    },
+    options?: { location?: { directory: string } },
+  ): Promise<Record<string, unknown>>
+  run(
+    input: { name: string; args: string },
+    options?: { location?: { directory: string } },
+  ): Promise<Record<string, unknown>>
+  operation(
+    input: { operationId: string },
+    options?: { location?: { directory: string } },
+  ): Promise<Record<string, unknown>>
 }
 
 type TuiRoute =
@@ -108,17 +117,48 @@ async function verifyInstalledTui(
   let sidebar: ((input: { sessionID: string }) => unknown) | undefined
   const sessions = new Map<
     string,
-    { model?: { providerID: string; id: string } }
+    {
+      model?: { providerID: string; id: string }
+      location?: { directory: string }
+    }
   >()
+  const rpcLocations: Array<{ method: string; directory: string | undefined }> =
+    []
+  const currentDirectory = '/packed/current'
   const listeners = new Set<(event: unknown) => void>()
   const ctx = {
     client: {
       rpc: () => ({
-        sidebarQuota: (input: { mode: 'cache' | 'ensure' }) =>
-          handlers.sidebarQuota(input),
-        run: (input: { name: string; args: string }) => handlers.run(input),
-        operation: (input: { operationId: string }) =>
-          handlers.operation(input),
+        sidebarQuota: (
+          input: { mode: 'cache' | 'ensure' },
+          options?: { location?: { directory: string } },
+        ) => {
+          rpcLocations.push({
+            method: 'sidebarQuota',
+            directory: options?.location?.directory,
+          })
+          return handlers.sidebarQuota(input, options)
+        },
+        run: (
+          input: { name: string; args: string },
+          options?: { location?: { directory: string } },
+        ) => {
+          rpcLocations.push({
+            method: 'run',
+            directory: options?.location?.directory,
+          })
+          return handlers.run(input, options)
+        },
+        operation: (
+          input: { operationId: string },
+          options?: { location?: { directory: string } },
+        ) => {
+          rpcLocations.push({
+            method: 'operation',
+            directory: options?.location?.directory,
+          })
+          return handlers.operation(input, options)
+        },
       }),
     },
     keymap: {
@@ -156,7 +196,11 @@ async function verifyInstalledTui(
       },
       toast: { show: () => {} },
     },
+    get location() {
+      return { directory: currentDirectory }
+    },
     data: {
+      location: { default: () => ({ directory: '/packed/default' }) },
       session: {
         get: (sessionID: string) => sessions.get(sessionID),
         sync: async () => {},
@@ -212,6 +256,7 @@ async function verifyInstalledTui(
   const sidebarSessionID = 'packed-sidebar-session'
   sessions.set(sidebarSessionID, {
     model: { providerID: 'google', id: 'gemini-3.8-flash' },
+    location: { directory: '/packed/sidebar' },
   })
   let sidebarRendered: Rendered | undefined
   try {
@@ -272,6 +317,13 @@ async function verifyInstalledTui(
     let frame = await settle(rendered)
     assertContains(frame, '63% remaining', 'quota card')
     assertContains(frame, 'resets ', 'quota reset')
+    if (
+      !rpcLocations.some(
+        ({ method, directory }) =>
+          method === 'run' && directory === '/packed/current',
+      )
+    )
+      throw new Error('Installed TUI run RPC omitted its working directory')
 
     handlers = {
       run: async () => {
@@ -352,6 +404,15 @@ async function verifyInstalledTui(
       snapshot: { kind: 'account', accounts: [] },
     })
     frame = await settle(rendered)
+    if (
+      !rpcLocations.some(
+        ({ method, directory }) =>
+          method === 'operation' && directory === '/packed/current',
+      )
+    )
+      throw new Error(
+        'Installed TUI operation RPC omitted its initiating directory',
+      )
     assertContains(frame, 'Current family accounts', 'newer status view')
     assertContains(frame, 'Claude: Status Claude', 'newer status view')
     if (frame.includes('Late OAuth completion')) {
@@ -396,13 +457,23 @@ async function verifyInstalledTui(
       { width: 44, height: 32 },
     )
     frame = await settle(sidebarRendered)
+    if (
+      !rpcLocations.some(
+        ({ method, directory }) =>
+          method === 'sidebarQuota' && directory === '/packed/sidebar',
+      )
+    )
+      throw new Error('Installed sidebar RPC omitted its session directory')
     assertContains(frame, 'Packed sidebar account', 'sidebar cache')
-    assertContains(frame, '1 account · Gemini', 'sidebar selected-group header')
-    assertContains(frame, 'Gemini: 61%', 'sidebar cache')
-    assertContains(frame, 'Weekly 18%', 'sidebar windows')
+    assertContains(frame, '1 account · remaining', 'sidebar account summary')
+    assertContains(frame, 'Gemini', 'sidebar selected-group header')
+    assertContains(frame, 'Gm 5h', 'sidebar cache')
+    assertContains(frame, 'NG 7d', 'sidebar windows')
+    assertContains(frame, '61%', 'sidebar cache')
+    assertContains(frame, '18%', 'sidebar windows')
     resolveFresh(sidebarResult(88, 'live'))
     frame = await settle(sidebarRendered)
-    assertContains(frame, 'Gemini: 88%', 'sidebar fresh quota')
+    assertContains(frame, '88%', 'sidebar fresh quota')
     sessions.set(sidebarSessionID, {
       model: { providerID: 'openai', id: 'gpt-4o' },
     })
@@ -415,7 +486,7 @@ async function verifyInstalledTui(
         },
       })
     frame = await settle(sidebarRendered)
-    if (frame.includes('Antigravity quota')) {
+    if (frame.includes('Antigravity')) {
       throw new Error('Packed sidebar remained visible after model switch')
     }
   } finally {

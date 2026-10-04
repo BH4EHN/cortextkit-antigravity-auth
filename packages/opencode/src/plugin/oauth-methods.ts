@@ -1,4 +1,5 @@
 import { exec } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import type { AuthOAuthResult as V1AuthOAuthResult } from '@opencode-ai/plugin'
 import type { AntigravityTokenExchangeResult } from '../antigravity/oauth'
@@ -42,6 +43,10 @@ import { getAntigravityVersionResolution } from './version'
 type V1AuthCallbackResult = Awaited<
   ReturnType<NonNullable<V1AuthOAuthResult['callback']>>
 >
+
+function quotaAccountIdentity(refreshToken: string): string {
+  return createHash('sha256').update(refreshToken).digest('hex').slice(0, 16)
+}
 
 function toV1AuthCallbackResult(
   result: AntigravityTokenExchangeResult,
@@ -565,6 +570,7 @@ export function createOAuthMethods({
                 const quotaUpdates = new Map<
                   string,
                   {
+                    succeeded: boolean
                     quota?: AccountMetadataV3['cachedQuota']
                     perModel?: AccountMetadataV3['cachedPerModelQuota']
                     updatedAccount?: AccountMetadataV3
@@ -582,6 +588,28 @@ export function createOAuthMethods({
                   console.log(
                     `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
                   )
+
+                  const targetRefreshToken =
+                    existingStorage.accounts[res.index]?.refreshToken
+                  if (targetRefreshToken && res.status !== 'disabled') {
+                    const updatedAt = Date.now()
+                    const previous = quotaUpdates.get(targetRefreshToken)
+                    const succeeded =
+                      res.status === 'ok' &&
+                      res.quota !== undefined &&
+                      res.quota.error === undefined
+                    quotaUpdates.set(targetRefreshToken, {
+                      succeeded,
+                      ...(succeeded
+                        ? {
+                            quota: res.quota?.groups,
+                            perModel: res.quota?.perModel,
+                          }
+                        : {}),
+                      updatedAccount: res.updatedAccount,
+                      updatedAt: Math.max(previous?.updatedAt ?? 0, updatedAt),
+                    })
+                  }
 
                   if (res.status === 'error') {
                     console.log(`  ❌ Error: ${res.error}\n`)
@@ -716,20 +744,6 @@ export function createOAuthMethods({
                   console.log('')
 
                   // Cache quota data for soft quota protection
-                  const targetRefreshToken =
-                    existingStorage.accounts[res.index]?.refreshToken
-                  if (!targetRefreshToken) continue
-                  const updatedAt = Date.now()
-                  const existing = quotaUpdates.get(targetRefreshToken)
-                  quotaUpdates.set(targetRefreshToken, {
-                    quota: res.quota?.groups,
-                    perModel: res.quota?.perModel,
-                    updatedAccount: res.updatedAccount,
-                    updatedAt:
-                      existing && existing.updatedAt > updatedAt
-                        ? existing.updatedAt
-                        : updatedAt,
-                  })
                 }
                 if (quotaUpdates.size > 0) {
                   await accountAccess.mutateAccounts((current) => {
@@ -744,9 +758,22 @@ export function createOAuthMethods({
                       current.accounts[idx] = {
                         ...target,
                         ...(update.updatedAccount ?? {}),
-                        cachedQuota: update.quota,
-                        cachedPerModelQuota: update.perModel,
+                        cachedQuota: update.succeeded
+                          ? update.quota
+                          : target.cachedQuota,
+                        cachedPerModelQuota: update.succeeded
+                          ? update.perModel
+                          : target.cachedPerModelQuota,
+                        cachedQuotaAccountId: update.succeeded
+                          ? quotaAccountIdentity(
+                              update.updatedAccount?.refreshToken ??
+                                refreshToken,
+                            )
+                          : target.cachedQuotaAccountId,
                         cachedQuotaUpdatedAt: update.updatedAt,
+                        cachedQuotaSuccessAt: update.succeeded
+                          ? update.updatedAt
+                          : target.cachedQuotaSuccessAt,
                       }
                       changed = true
                     }

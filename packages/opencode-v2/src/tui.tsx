@@ -1,5 +1,5 @@
 import type { Definition } from '@opencode-ai/plugin/tui/plugin'
-import { TextAttributes } from '@opentui/core'
+import { type BoxRenderable, TextAttributes } from '@opentui/core'
 import {
   createEffect,
   createRoot,
@@ -30,28 +30,49 @@ export const tui = {
       const [messages, setMessages] = createSignal<string[]>([])
       const [snapshot, setSnapshot] = createSignal<AntigravityPanelSnapshot>()
       const [busy, setBusy] = createSignal(false)
-      const [operationId, setOperationId] = createSignal<string>()
+      const [operation, setOperation] = createSignal<{
+        operationId: string
+        directory: string
+        sequence: number
+      }>()
       const rpc = ctx.client.rpc(antigravityRpc)
       const sessionData = ctx.data
       let sequence = 0
       let timer: ReturnType<typeof setInterval> | undefined
+
+      function resolveLocation(sessionID?: string) {
+        const directory =
+          (sessionID
+            ? sessionData.session.get(sessionID)?.location?.directory
+            : undefined) ??
+          ctx.location?.directory ??
+          sessionData.location.default().directory
+        return { directory }
+      }
 
       function stopPolling() {
         if (timer) clearInterval(timer)
         timer = undefined
       }
 
-      async function poll(id: string) {
+      async function poll(current: {
+        operationId: string
+        directory: string
+        sequence: number
+      }) {
         try {
-          const result = await rpc.operation({ operationId: id })
-          if (operationId() !== id) return
+          const result = await rpc.operation(
+            { operationId: current.operationId },
+            { location: { directory: current.directory } },
+          )
+          if (operation() !== current || sequence !== current.sequence) return
           if (view() === 'account') {
             if (result.snapshot) setSnapshot(result.snapshot)
             setMessages(result.notices ?? result.messages)
           }
           if (result.state !== 'pending') {
             stopPolling()
-            setOperationId(undefined)
+            setOperation(undefined)
             if (result.state === 'failed')
               ctx.ui.toast.show({
                 variant: 'error',
@@ -67,9 +88,9 @@ export const tui = {
               })
           }
         } catch (error) {
-          if (operationId() !== id) return
+          if (operation() !== current || sequence !== current.sequence) return
           stopPolling()
-          setOperationId(undefined)
+          setOperation(undefined)
           if (view() === 'account')
             setMessages([
               `Could not check Antigravity login: ${message(error)}`,
@@ -79,20 +100,33 @@ export const tui = {
 
       async function run(name: View, args = '') {
         const current = ++sequence
+        const route = ctx.ui.router.current()
+        const directory = resolveLocation(
+          route.type === 'session' ? route.sessionID : undefined,
+        ).directory
+        stopPolling()
+        setOperation(undefined)
         setView(name)
         setBusy(true)
         setMessages([])
         setSnapshot(undefined)
         try {
-          const result = await rpc.run({ name, args })
+          const result = await rpc.run(
+            { name, args },
+            { location: { directory } },
+          )
           if (current !== sequence) return
           setMessages(result.notices ?? result.messages)
           setSnapshot(result.snapshot)
           if (result.operationId) {
-            setOperationId(result.operationId)
-            stopPolling()
-            timer = setInterval(() => void poll(result.operationId!), 1000)
-            void poll(result.operationId)
+            const handle = {
+              operationId: result.operationId,
+              directory,
+              sequence: current,
+            }
+            setOperation(handle)
+            timer = setInterval(() => void poll(handle), 1000)
+            void poll(handle)
           }
           setBusy(false)
         } catch (error) {
@@ -288,112 +322,143 @@ export const tui = {
         )
       }
 
+      function quotaDetails(
+        cell: SidebarQuotaSnapshot['accounts'][number]['gemini'],
+        width: number,
+      ): string[] {
+        const state =
+          cell.refreshState === 'refreshing'
+            ? 'refreshing'
+            : cell.refreshState === 'error'
+              ? 'refresh failed'
+              : cell.refreshState === 'unavailable'
+                ? 'N/A'
+                : undefined
+        const timestamp =
+          cell.updatedAt !== undefined && Number.isFinite(cell.updatedAt)
+            ? new Date(cell.updatedAt)
+            : undefined
+        const validTimestamp = timestamp && Number.isFinite(timestamp.getTime())
+        const source = cell.source === 'live' ? 'Live' : 'Cached'
+        const base = validTimestamp
+          ? `${source} · ${String(timestamp.getMonth() + 1).padStart(2, '0')}-${String(timestamp.getDate()).padStart(2, '0')} ${String(timestamp.getHours()).padStart(2, '0')}:${String(timestamp.getMinutes()).padStart(2, '0')}`
+          : `${source} · update unknown`
+        const suffix = [
+          validTimestamp
+            ? `${relative(Date.now() - cell.updatedAt!)} ago`
+            : undefined,
+          state,
+        ].filter((part): part is string => part !== undefined)
+        if (suffix.length === 0) return [base]
+        const tail = suffix.join(' · ')
+        return base.length + 3 + tail.length > Math.max(1, width)
+          ? [base, tail]
+          : [`${base} · ${tail}`]
+      }
+
       function SidebarQuotaCell(props: {
-        label: string
+        label: 'Gm' | 'NG'
         cell: SidebarQuotaSnapshot['accounts'][number]['gemini']
         selected: boolean
+        slotWidth: number
+        showDetails?: boolean
       }) {
         const value = () => props.cell.remainingPercent
         const severityColor = (percentage = value()) => {
           if (percentage === null) return theme().textMuted
-          if (percentage < 10)
+          if (percentage <= 20)
             return theme().error ?? theme().accent ?? theme().text
-          if (percentage < 20)
+          if (percentage <= 50)
             return theme().warning ?? theme().accent ?? theme().text
           return theme().success ?? theme().accent ?? theme().text
         }
-        const filledCells = () => {
-          const percentage = value()
-          if (percentage === null || percentage <= 0) return 0
-          if (percentage >= 100) return 8
-          const filled = Math.max(
-            1,
-            Math.min(7, Math.round((percentage * 8) / 100)),
+        const filledCells = (percentage = value()) => {
+          if (
+            percentage === null ||
+            !Number.isFinite(percentage) ||
+            percentage <= 0
           )
-          return filled
+            return 0
+          return Math.round(Math.max(0, Math.min(100, percentage)) / 10)
         }
-        const warning = () => {
-          const percentage = value()
-          if (percentage === null) return ''
-          if (percentage <= 0) return ' ▲ Empty'
-          if (percentage < 20) return ' ▲ Low'
-          return ''
+        const rows = () => {
+          const windows = [...props.cell.windows].sort((left, right) => {
+            if (left.name === right.name) return 0
+            return left.name === '5h' ? -1 : 1
+          })
+          return windows.length > 0
+            ? windows.map((window) => ({
+                label: `${props.label} ${window.name === 'weekly' ? '7d' : '5h'}`,
+                value: window.remainingPercent,
+                resetAt: window.resetAt,
+              }))
+            : [
+                {
+                  label: props.label,
+                  value: value(),
+                  resetAt: props.cell.resetAt,
+                },
+              ]
         }
-        const state = () =>
-          props.cell.refreshState === 'refreshing'
-            ? ' · refresh'
-            : props.cell.refreshState === 'error'
-              ? ' · failed'
-              : props.cell.refreshState === 'unavailable'
-                ? ' · N/A'
-                : ''
         return (
           <box flexDirection='column'>
-            <box flexDirection='row'>
-              <text
-                width={
-                  props.selected
-                    ? props.label.length + 2
-                    : props.label.length + 1
-                }
-                flexShrink={0}
-                fg={props.selected ? theme().accent : theme().textMuted}
-                attributes={props.selected ? TextAttributes.BOLD : 0}
-              >
-                {props.selected ? '› ' : ' '}
-                {props.label}
-              </text>
-              <text fg={severityColor()}>
-                {': '}
-                {value() === null ? '—' : `${value()}%`}
-                {warning()}
-              </text>
-            </box>
-            <box flexDirection='row'>
-              <box width={8} flexShrink={0} flexDirection='row'>
-                <text fg={severityColor()}>
-                  {value() === null ? '' : '█'.repeat(filledCells())}
-                </text>
-                <text fg={theme().textMuted}>
-                  {value() === null
-                    ? '────────'
-                    : '░'.repeat(8 - filledCells())}
-                </text>
-              </box>
-              <text fg={theme().textMuted}>
-                {' '}
-                {props.cell.source === 'live' ? 'Live' : 'Cached'}
-                {props.cell.updatedAt !== undefined
-                  ? ` ${relative(Date.now() - props.cell.updatedAt)}`
-                  : ''}
-                {state()}
-              </text>
-            </box>
-            <For each={props.cell.windows}>
-              {(window) => (
-                <box flexDirection='row'>
-                  <text fg={theme().textMuted}>
-                    {'    '}
-                    {window.name === 'weekly' ? 'Weekly' : '5h'}{' '}
+            <For each={rows()}>
+              {(row) => (
+                <box flexDirection='row' width='100%'>
+                  <text
+                    width={5}
+                    flexShrink={0}
+                    fg={props.selected ? theme().accent : theme().textMuted}
+                    attributes={props.selected ? TextAttributes.BOLD : 0}
+                  >
+                    {row.label}
                   </text>
-                  <text fg={severityColor(window.remainingPercent)}>
-                    {window.remainingPercent === null
-                      ? '—'
-                      : `${window.remainingPercent}%`}
+                  <text> </text>
+                  <text width={10} flexShrink={0} fg={severityColor(row.value)}>
+                    {row.value === null
+                      ? '──────────'
+                      : `${'▰'.repeat(filledCells(row.value))}${'▱'.repeat(10 - filledCells(row.value))}`}
                   </text>
-                  <text fg={theme().textMuted}>
-                    {window.resetAt !== undefined
-                      ? ` · ${relative(window.resetAt - Date.now())}`
-                      : ''}
-                  </text>
+                  <box flexGrow={1} />
+                  <box width={11} flexShrink={0} flexDirection='row'>
+                    <text
+                      width={4}
+                      flexShrink={0}
+                      fg={severityColor(row.value)}
+                    >
+                      {row.value === null
+                        ? '   —'
+                        : `${String(row.value).padStart(3)}%`}
+                    </text>
+                    <text> </text>
+                    <box
+                      width={6}
+                      flexShrink={0}
+                      flexDirection='row'
+                      justifyContent='flex-end'
+                    >
+                      <Show when={row.resetAt !== undefined}>
+                        <text fg={theme().textMuted}>
+                          {relative(row.resetAt! - Date.now())}
+                        </text>
+                      </Show>
+                    </box>
+                  </box>
                 </box>
               )}
             </For>
+            <Show when={props.showDetails !== false}>
+              <For each={quotaDetails(props.cell, props.slotWidth)}>
+                {(line) => <text fg={theme().textMuted}>{line}</text>}
+              </For>
+            </Show>
           </box>
         )
       }
 
       function Sidebar(props: { sessionID: string }) {
+        const [sidebarWidth, setSidebarWidth] = createSignal(0)
+        let sidebarBox: BoxRenderable | undefined
         const [model, setModel] = createSignal<
           { providerID: string; id: string } | undefined
         >()
@@ -402,6 +467,8 @@ export const tui = {
         const [sessionNotice, setSessionNotice] = createSignal<string>()
         let active = false
         let generation = 0
+        let contextGeneration = 0
+        let generationDirectory: string | undefined
         let requestInFlight: number | undefined
         let timer: ReturnType<typeof setInterval> | undefined
 
@@ -437,11 +504,18 @@ export const tui = {
           setSessionNotice(undefined)
         }
 
-        async function request(mode: 'cache' | 'ensure', current: number) {
+        async function request(
+          mode: 'cache' | 'ensure',
+          current: number,
+          directory: string,
+        ) {
           if (requestInFlight === current) return
           requestInFlight = current
           try {
-            const result = await rpc.sidebarQuota({ mode })
+            const result = await rpc.sidebarQuota(
+              { mode },
+              { location: { directory } },
+            )
             if (current !== generation || !active) return
             setData(result)
             setNotice(result.notices[0])
@@ -455,18 +529,22 @@ export const tui = {
           }
         }
 
-        async function load(current: number) {
-          await request('cache', current)
-          if (current === generation && active) await request('ensure', current)
+        async function load(current: number, directory: string) {
+          await request('cache', current, directory)
+          if (current === generation && active)
+            await request('ensure', current, directory)
         }
 
         function activate() {
           if (active) return
           active = true
           const current = ++generation
-          void load(current)
+          const directory =
+            generationDirectory ?? resolveLocation(props.sessionID).directory
+          generationDirectory = directory
+          void load(current, directory)
           timer = setInterval(() => {
-            void request('ensure', current)
+            void request('ensure', current, directory)
           }, 15_000)
         }
 
@@ -478,13 +556,10 @@ export const tui = {
         }
 
         createEffect(() => {
-          const selected = model()
-          if (isAntigravityModel(selected)) activate()
-          else deactivate()
-        })
-
-        createEffect(() => {
           const sessionID = props.sessionID
+          const directory = resolveLocation(sessionID).directory
+          const currentContext = ++contextGeneration
+          generationDirectory = directory
           generation++
           active = false
           stop()
@@ -497,6 +572,7 @@ export const tui = {
             (event) => selectFromEvent(event, sessionID),
           )
           onCleanup(() => {
+            contextGeneration++
             generation++
             active = false
             stop()
@@ -506,31 +582,76 @@ export const tui = {
           void sessionData.session
             .sync(sessionID)
             .then(() => {
-              if (props.sessionID === sessionID) {
+              if (
+                contextGeneration === currentContext &&
+                props.sessionID === sessionID &&
+                generationDirectory === directory
+              ) {
                 readModel(sessionID)
                 setSessionNotice(undefined)
               }
             })
             .catch(() => {
-              if (props.sessionID === sessionID)
+              if (
+                contextGeneration === currentContext &&
+                props.sessionID === sessionID &&
+                generationDirectory === directory
+              )
                 setSessionNotice(
                   'Could not load the selected session model yet.',
                 )
             })
         })
 
+        createEffect(() => {
+          const selected = model()
+          if (isAntigravityModel(selected)) activate()
+          else deactivate()
+        })
+
         const group = () => quotaGroupForAntigravityModel(model())
+        const accountState = (state: string) =>
+          state === 'verification-required' ? 'VERIFY' : state.toUpperCase()
+        const accountLabel = (
+          account: SidebarQuotaSnapshot['accounts'][number],
+        ) => {
+          const statusWidth =
+            accountState(account.state).length +
+            (account.current !== 'none' ? 8 : 0)
+          const maxWidth = Math.max(1, sidebarWidth() - 1 - statusWidth)
+          return account.label.length > maxWidth
+            ? `${account.label.slice(0, maxWidth - 1)}…`
+            : account.label
+        }
         return (
           <Show when={group()}>
             {(selectedGroup) => (
-              <box flexDirection='column' paddingY={1}>
-                <text fg={theme().accent}>Antigravity quota</text>
+              <box
+                ref={(element) => {
+                  sidebarBox = element
+                  setSidebarWidth(element.width)
+                }}
+                onSizeChange={() => {
+                  if (sidebarBox) setSidebarWidth(sidebarBox.width)
+                }}
+                flexDirection='column'
+                width='100%'
+                paddingY={1}
+              >
+                <box flexDirection='row' width='100%'>
+                  <text fg={theme().accent} attributes={TextAttributes.BOLD}>
+                    Antigravity
+                  </text>
+                  <box flexGrow={1} />
+                  <text fg={theme().accent} attributes={TextAttributes.BOLD}>
+                    {selectedGroup() === 'gemini' ? 'Gemini' : 'Claude/other'}
+                  </text>
+                </box>
                 <text fg={theme().textMuted}>
                   {data()
                     ? `${data()!.accounts.length} ${data()!.accounts.length === 1 ? 'account' : 'accounts'}`
                     : 'Loading quota…'}
-                  {' · '}
-                  {selectedGroup() === 'gemini' ? 'Gemini' : 'Claude/other'}
+                  {' · remaining'}
                 </text>
                 <Show
                   when={data() && data()!.accounts.length > 0}
@@ -541,44 +662,70 @@ export const tui = {
                   }
                 >
                   <For each={data()?.accounts ?? []}>
-                    {(account) => (
-                      <box
-                        flexDirection='column'
-                        marginTop={1}
-                        border
-                        borderStyle='single'
-                        borderColor={theme().borderSubtle}
-                      >
-                        <box flexDirection='row'>
-                          <text fg={theme().text}>{account.label}</text>
-                          <text
-                            fg={
-                              account.state === 'active'
-                                ? theme().success
-                                : theme().warning
-                            }
+                    {(account) => {
+                      const deduplicateDetails =
+                        account.gemini.refreshState === 'idle' &&
+                        account.nonGemini.refreshState === 'idle' &&
+                        account.gemini.source === account.nonGemini.source &&
+                        account.gemini.updatedAt === account.nonGemini.updatedAt
+                      return (
+                        <box flexDirection='column' marginTop={1}>
+                          <box
+                            flexDirection='row'
+                            width='100%'
+                            justifyContent='space-between'
                           >
-                            {'  '}
-                            {account.state === 'verification-required'
-                              ? 'VERIFY'
-                              : account.state.toUpperCase()}
-                          </text>
-                          <Show when={account.current !== 'none'}>
-                            <text fg={theme().success}> Default</text>
+                            <text
+                              fg={theme().text}
+                              attributes={TextAttributes.BOLD}
+                              flexShrink={1}
+                            >
+                              {accountLabel(account)}
+                            </text>
+                            <box flexDirection='row'>
+                              <text
+                                fg={
+                                  account.state === 'active'
+                                    ? theme().success
+                                    : theme().warning
+                                }
+                              >
+                                {accountState(account.state)}
+                              </text>
+                              <Show when={account.current !== 'none'}>
+                                <text fg={theme().textMuted}> Default</text>
+                              </Show>
+                            </box>
+                          </box>
+                          <SidebarQuotaCell
+                            label='Gm'
+                            cell={account.gemini}
+                            selected={selectedGroup() === 'gemini'}
+                            slotWidth={sidebarWidth()}
+                            showDetails={!deduplicateDetails}
+                          />
+                          <SidebarQuotaCell
+                            label='NG'
+                            cell={account.nonGemini}
+                            selected={selectedGroup() === 'non-gemini'}
+                            slotWidth={sidebarWidth()}
+                            showDetails={!deduplicateDetails}
+                          />
+                          <Show when={deduplicateDetails}>
+                            <For
+                              each={quotaDetails(
+                                account.gemini,
+                                sidebarWidth(),
+                              )}
+                            >
+                              {(line) => (
+                                <text fg={theme().textMuted}>{line}</text>
+                              )}
+                            </For>
                           </Show>
                         </box>
-                        <SidebarQuotaCell
-                          label='Gemini'
-                          cell={account.gemini}
-                          selected={selectedGroup() === 'gemini'}
-                        />
-                        <SidebarQuotaCell
-                          label='Claude/other'
-                          cell={account.nonGemini}
-                          selected={selectedGroup() === 'non-gemini'}
-                        />
-                      </box>
-                    )}
+                      )
+                    }}
                   </For>
                 </Show>
                 <Show when={notice()}>
@@ -608,7 +755,7 @@ export const tui = {
                 {'  '}
                 {view().toUpperCase()}
                 {busy() ? ' · LOADING' : ''}
-                {operationId() ? ' · OAUTH IN PROGRESS' : ''}
+                {operation() ? ' · OAUTH IN PROGRESS' : ''}
               </text>
             </box>
             <scrollbox flexGrow={1} flexShrink={1} scrollY>
@@ -736,6 +883,8 @@ export const tui = {
         },
       })
       return () => {
+        sequence++
+        setOperation(undefined)
         stopPolling()
         offCommands()
         offPanel()

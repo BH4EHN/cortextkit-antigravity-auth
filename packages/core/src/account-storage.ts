@@ -381,6 +381,22 @@ export function mergeAccountStorage(
         accountIneligibleReason: eligibilitySource.accountIneligibleReason,
         eligibilityStateUpdatedAt: eligibilitySource.eligibilityStateUpdatedAt,
       }
+      // Quota and its provenance are one snapshot. A partial writer that did
+      // not replace cachedQuota must not detach or erase the success stamp
+      // belonging to the existing snapshot.
+      if (Object.hasOwn(acc, 'cachedQuota')) {
+        // A replacement snapshot owns its provenance. Missing markers mean
+        // the producer cannot prove that this snapshot's identity/time is
+        // known, so never inherit markers from the previous snapshot.
+        merged.cachedQuotaAccountId = acc.cachedQuotaAccountId
+        merged.cachedQuotaSuccessAt = acc.cachedQuotaSuccessAt
+      } else {
+        // A partial patch that leaves cachedQuota untouched also leaves its
+        // identity and success timestamp attached to the existing snapshot.
+        merged.cachedQuota = existingAcc.cachedQuota
+        merged.cachedQuotaAccountId = existingAcc.cachedQuotaAccountId
+        merged.cachedQuotaSuccessAt = existingAcc.cachedQuotaSuccessAt
+      }
       if (merged.accountIneligible) {
         merged.enabled = false
       }

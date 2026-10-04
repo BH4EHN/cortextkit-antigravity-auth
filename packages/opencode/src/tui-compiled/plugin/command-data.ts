@@ -75,6 +75,7 @@ type CommandDataAccountMetadata = {
   >
   cachedQuotaUpdatedAt?: number
   cachedQuotaAccountId?: string
+  cachedQuotaSuccessAt?: number
   accountIneligible?: boolean
 }
 
@@ -190,6 +191,7 @@ interface LiveAccountSnapshot {
   >
   cachedQuotaUpdatedAt?: number
   cachedQuotaAccountId?: string
+  cachedQuotaSuccessAt?: number
   accountIneligible?: boolean
   coolingDownUntil?: number
   healthScore?: number
@@ -586,7 +588,9 @@ export function createCommandDataService(
           accountsForQuota[result.index]?.refreshToken
         if (!refreshToken) continue
         const groups =
-          result.status === 'ok' && result.quota?.groups
+          result.status === 'ok' &&
+          result.quota &&
+          result.quota.error === undefined
             ? result.quota.groups
             : undefined
         updates.push({ refreshToken, groups })
@@ -632,6 +636,7 @@ export function createCommandDataService(
                 // a stale snapshot after an account-index shift.
                 cachedQuotaAccountId: quotaAccountIdentity(entry.refreshToken),
                 cachedQuotaUpdatedAt: refreshedAt,
+                cachedQuotaSuccessAt: refreshedAt,
               }
             }
             // Error result keeps the previous cached percentage and only

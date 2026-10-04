@@ -16,6 +16,7 @@ import {
   formatRowsTable,
   parseAccountArgs,
   parseQuotaArgs,
+  projectPanelAccounts,
   projectRows,
   quotaAccountIdentity,
 } from '../src/commands.ts'
@@ -136,17 +137,46 @@ describe('projectRows', () => {
       cachedQuota: { gemini: { remainingFraction: 0.72, modelCount: 2 } },
       cachedQuotaAccountId: quotaAccountIdentity('token-a'),
       cachedQuotaUpdatedAt: FIXED_NOW - 60_000,
+      cachedQuotaSuccessAt: FIXED_NOW - 90_000,
     })
     const stale = managedAccount('token-b', {
       index: 1,
       cachedQuota: { 'non-gemini': { remainingFraction: 0.5, modelCount: 1 } },
       cachedQuotaAccountId: quotaAccountIdentity('some-other-token'),
+      cachedQuotaSuccessAt: FIXED_NOW - 30_000,
     })
     const rows = projectRows([matching, stale], { claude: 0, gemini: 0 })
     expect(rows[0]?.gemini.percent).toBe(72)
     expect(rows[0]?.updatedAt).toBe(FIXED_NOW - 60_000)
+    expect(rows[0]?.successAt).toBe(FIXED_NOW - 90_000)
+    expect(projectPanelAccounts(rows)[0]?.cacheSuccessAt).toBe(
+      FIXED_NOW - 90_000,
+    )
+    expect(projectPanelAccounts(rows)[0]?.cacheUpdatedAt).toBe(
+      FIXED_NOW - 60_000,
+    )
     expect(rows[1]?.nonGemini.percent).toBeNull()
     expect(rows[1]?.updatedAt).toBeUndefined()
+    expect(rows[1]?.successAt).toBeUndefined()
+    const legacy = projectRows(
+      [
+        managedAccount('legacy', {
+          cachedQuota: { gemini: { remainingFraction: 0.2, modelCount: 1 } },
+          cachedQuotaUpdatedAt: FIXED_NOW,
+          cachedQuotaSuccessAt: FIXED_NOW - 30_000,
+        }),
+      ],
+      { claude: 0, gemini: 0 },
+    )[0]!
+    expect(legacy.gemini.percent).toBe(20)
+    expect(legacy.updatedAt).toBe(FIXED_NOW)
+    expect(legacy.successAt).toBeUndefined()
+    expect(projectPanelAccounts([legacy])[0]?.cacheSuccessAt).toBeUndefined()
+    const orphanedMarker = projectRows(
+      [managedAccount('no-cache', { cachedQuotaSuccessAt: FIXED_NOW })],
+      { claude: 0, gemini: 0 },
+    )[0]!
+    expect(orphanedMarker.successAt).toBeUndefined()
   })
 
   test('marks per-family current accounts', () => {
@@ -672,6 +702,7 @@ describe('antigravity-quota refresh write-back', () => {
     expect(stored.cachedQuotaAccountId).toBe(
       quotaAccountIdentity('token-before'),
     )
+    expect(stored.cachedQuotaSuccessAt).toBe(FIXED_NOW)
   })
 
   test('keys updates by refresh token even when indices shifted', async () => {
@@ -685,8 +716,14 @@ describe('antigravity-quota refresh write-back', () => {
           cachedQuota: {
             'non-gemini': { remainingFraction: 0.1, modelCount: 1 },
           },
+          cachedQuotaAccountId: quotaAccountIdentity('token-b'),
+          cachedQuotaSuccessAt: 456,
         }),
-        storageAccount('token-a'),
+        storageAccount('token-a', {
+          cachedQuota: { gemini: { remainingFraction: 0.12, modelCount: 1 } },
+          cachedQuotaAccountId: quotaAccountIdentity('token-a'),
+          cachedQuotaSuccessAt: 123,
+        }),
       ]),
       snapshot,
       results: [
@@ -714,10 +751,14 @@ describe('antigravity-quota refresh write-back', () => {
     const tokenB = after.accounts.find((a) => a.refreshToken === 'token-b')
     const tokenA = after.accounts.find((a) => a.refreshToken === 'token-a')
     expect(tokenB?.cachedQuota?.gemini?.remainingFraction).toBe(0.66)
+    expect(tokenB?.cachedQuota?.['non-gemini']).toBeUndefined()
     expect(tokenB?.cachedQuotaAccountId).toBe(quotaAccountIdentity('token-b'))
     expect(tokenB?.cachedQuotaUpdatedAt).toBe(FIXED_NOW)
-    // Failed account keeps its previous percentages, timestamp bumps only.
-    expect(tokenA?.cachedQuota).toBeUndefined()
+    expect(tokenB?.cachedQuotaSuccessAt).toBe(FIXED_NOW)
+    // Failed account keeps its previous quota-success pair and only bumps attempt time.
+    expect(tokenA?.cachedQuota?.gemini?.remainingFraction).toBe(0.12)
+    expect(tokenA?.cachedQuotaAccountId).toBe(quotaAccountIdentity('token-a'))
+    expect(tokenA?.cachedQuotaSuccessAt).toBe(123)
     expect(tokenA?.cachedQuotaUpdatedAt).toBe(FIXED_NOW)
     expect(fixtures.outputs.at(-1)?.text).toContain('Refresh failures')
     expect(fixtures.quotaFetches()).toBe(1)
@@ -730,6 +771,7 @@ describe('antigravity-quota refresh write-back', () => {
           cachedQuota: { gemini: { remainingFraction: 0.25, modelCount: 1 } },
           cachedQuotaAccountId: quotaAccountIdentity('token-a'),
           cachedQuotaUpdatedAt: 123,
+          cachedQuotaSuccessAt: 111,
         }),
         storageAccount('token-b'),
       ]),
@@ -760,7 +802,9 @@ describe('antigravity-quota refresh write-back', () => {
     const [a, b] = fixtures.storage().accounts
     expect(a?.cachedQuota?.gemini?.remainingFraction).toBe(0.25)
     expect(a?.cachedQuotaUpdatedAt).toBe(FIXED_NOW)
+    expect(a?.cachedQuotaSuccessAt).toBe(111)
     expect(b?.cachedQuota?.['non-gemini']?.remainingFraction).toBe(0.75)
+    expect(b?.cachedQuotaSuccessAt).toBe(FIXED_NOW)
     expect(fixtures.outputs.at(-1)?.text).toContain('Refresh failures')
   })
 

@@ -1,17 +1,27 @@
 import { afterEach, describe, expect, it } from 'bun:test'
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
 import {
   createOpenCodeV2Harness,
+  createOpenCodeV2RpcRoutingHarness,
   type OpenCodeV2Harness,
+  type OpenCodeV2RpcRoutingHarness,
 } from './opencode-v2-harness.ts'
 
 let harness: OpenCodeV2Harness | undefined
+let rpcHarness: OpenCodeV2RpcRoutingHarness | undefined
 
 afterEach(async () => {
-  await harness?.dispose()
+  const activeHarness = harness
+  const activeRpcHarness = rpcHarness
   harness = undefined
+  rpcHarness = undefined
+  try {
+    await activeHarness?.dispose()
+  } finally {
+    await activeRpcHarness?.dispose()
+  }
 })
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -22,6 +32,128 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 describe('OpenCode 2 host flow', () => {
+  it('scopes plugin RPC availability to the requesting project directory', async () => {
+    rpcHarness = await createOpenCodeV2RpcRoutingHarness()
+
+    const calls = [
+      {
+        method: 'sidebarQuota' as const,
+        input: { mode: 'cache' as const },
+      },
+      {
+        method: 'run' as const,
+        input: { name: 'quota' as const, args: '' as const },
+      },
+    ]
+
+    for (const call of calls) {
+      const unscoped = await rpcHarness.request(call.method, call.input)
+      expect(unscoped.status).toBe(400)
+      expect(unscoped.body).toMatchObject({
+        _tag: 'RpcError',
+        type: 'rpc.unavailable',
+      })
+
+      const scoped = await rpcHarness.request(
+        call.method,
+        call.input,
+        rpcHarness.projectDirectory,
+      )
+      expect(scoped.status).toBe(200)
+      if (call.method === 'sidebarQuota') {
+        const snapshot = asRecord(asRecord(scoped.body).output)
+        expect(snapshot.accounts).toEqual([])
+        expect(Array.isArray(snapshot.notices)).toBe(true)
+      } else {
+        const result = asRecord(asRecord(scoped.body).output)
+        expect(result.messages).toContain('The Antigravity pool is empty.')
+        expect(asRecord(result.snapshot)).toEqual({
+          kind: 'quota',
+          accounts: [],
+        })
+      }
+    }
+
+    expect(existsSync(rpcHarness.databaseFile)).toBe(true)
+    expect(existsSync(rpcHarness.accountsFile)).toBe(true)
+    expect(JSON.parse(readFileSync(rpcHarness.accountsFile, 'utf8'))).toEqual({
+      version: 4,
+      accounts: [],
+      activeIndex: 0,
+    })
+  }, 30_000)
+
+  it('serializes non-empty disabled-account quota snapshots over real RPC', async () => {
+    rpcHarness = await createOpenCodeV2RpcRoutingHarness({
+      accountPool: 'disabled',
+    })
+
+    const sidebarResponse = await rpcHarness.request(
+      'sidebarQuota',
+      { mode: 'cache' },
+      rpcHarness.projectDirectory,
+    )
+    const quotaResponse = await rpcHarness.request(
+      'run',
+      { name: 'quota', args: '' },
+      rpcHarness.projectDirectory,
+    )
+
+    expect(sidebarResponse.status).toBe(200)
+    expect(quotaResponse.status).toBe(200)
+
+    const sidebarOutput = asRecord(asRecord(sidebarResponse.body).output)
+    expect(sidebarOutput.accounts).toHaveLength(1)
+    const sidebarRow = asRecord((sidebarOutput.accounts as unknown[])[0])
+    expect(sidebarRow.state).toBe('disabled')
+    for (const group of ['gemini', 'nonGemini']) {
+      const cell = asRecord(sidebarRow[group])
+      expect(cell.remainingPercent).toBeNull()
+      expect(cell.windows).toEqual([])
+      expect(Object.hasOwn(cell, 'resetAt')).toBe(false)
+      expect(Object.hasOwn(cell, 'updatedAt')).toBe(false)
+    }
+    expect(Object.hasOwn(sidebarRow, 'cacheUpdatedAt')).toBe(false)
+    expect(Object.hasOwn(sidebarRow, 'cacheSuccessAt')).toBe(false)
+
+    const quotaOutput = asRecord(asRecord(quotaResponse.body).output)
+    const snapshot = asRecord(quotaOutput.snapshot)
+    expect(snapshot.kind).toBe('quota')
+    expect(snapshot.accounts).toHaveLength(1)
+    const quotaRow = asRecord((snapshot.accounts as unknown[])[0])
+    expect(quotaRow.state).toBe('disabled')
+    for (const group of ['gemini', 'nonGemini']) {
+      const cell = asRecord(quotaRow[group])
+      expect(cell.remainingPercent).toBeNull()
+      expect(cell.windows).toEqual([])
+      expect(Object.hasOwn(cell, 'resetAt')).toBe(false)
+    }
+    expect(Object.hasOwn(quotaRow, 'cacheUpdatedAt')).toBe(false)
+    expect(Object.hasOwn(quotaRow, 'cacheSuccessAt')).toBe(false)
+
+    expect(existsSync(rpcHarness.databaseFile)).toBe(true)
+    const pool = JSON.parse(readFileSync(rpcHarness.accountsFile, 'utf8')) as {
+      accounts: Array<{
+        addedAt: number
+        enabled?: boolean
+        lastUsed: number
+        projectId: string
+        rateLimitResetTimes: Record<string, number>
+        refreshToken: string
+      }>
+    }
+    expect(pool.accounts).toEqual([
+      {
+        refreshToken: 'synthetic-rpc-disabled-account',
+        projectId: 'synthetic-rpc-project',
+        addedAt: 1,
+        lastUsed: 0,
+        enabled: false,
+        rateLimitResetTimes: {},
+      },
+    ])
+  }, 30_000)
+
   it('loads the built server contract and routes a real host request through Antigravity', async () => {
     harness = await createOpenCodeV2Harness()
 

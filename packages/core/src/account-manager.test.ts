@@ -1,6 +1,7 @@
 import { describe, expect, it, jest } from 'bun:test'
 import { AccountManager } from './account-manager.ts'
 import type { AccountStorageStore } from './account-storage.ts'
+import { mergeAccountStorage } from './account-storage.ts'
 import type { AccountStorageV4 } from './account-types.ts'
 
 function createStore(initial: AccountStorageV4 | null = null) {
@@ -263,6 +264,107 @@ describe('core AccountManager', () => {
     expect(memory.state()?.accounts).toHaveLength(1)
   })
 
+  it('keeps a newer survivor quota snapshot when replacing a pool after removal', async () => {
+    const initial: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        { refreshToken: 'removed', addedAt: 1, lastUsed: 0 },
+        {
+          refreshToken: 'survivor',
+          addedAt: 1,
+          lastUsed: 0,
+          cachedQuota: { gemini: { remainingFraction: 0.2, modelCount: 1 } },
+          cachedQuotaAccountId: 'old-owner',
+          cachedQuotaUpdatedAt: 10,
+          cachedQuotaSuccessAt: 10,
+        },
+      ],
+      activeIndex: 0,
+    }
+    let state = initial
+    const store: AccountStorageStore = {
+      load: async () => state,
+      saveMerged: async (_path, incoming) => {
+        state = mergeAccountStorage(state, incoming)
+        return state
+      },
+      mutate: async (_path, fn) => {
+        state = (await fn(state)) ?? state
+        return state
+      },
+      clear: async () => {},
+    }
+    const manager = new AccountManager(undefined, initial, { store })
+    state = mergeAccountStorage(state, {
+      ...initial,
+      accounts: [
+        {
+          ...initial.accounts[1]!,
+          cachedQuota: { gemini: { remainingFraction: 0.8, modelCount: 1 } },
+          cachedQuotaAccountId: 'new-owner',
+          cachedQuotaUpdatedAt: 20,
+          cachedQuotaSuccessAt: 20,
+        },
+      ],
+    })
+    expect(manager.removeAccountByIndex(0)).toBe(true)
+    await manager.saveToDiskReplace()
+    expect(state.accounts.map((account) => account.refreshToken)).toEqual([
+      'survivor',
+    ])
+    expect(state.accounts[0]).toMatchObject({
+      cachedQuota: { gemini: { remainingFraction: 0.8, modelCount: 1 } },
+      cachedQuotaAccountId: 'new-owner',
+      cachedQuotaUpdatedAt: 20,
+      cachedQuotaSuccessAt: 20,
+    })
+  })
+
+  it('keeps an update made during replacement dirty for the next save', async () => {
+    let state = stored
+    let releaseReplace!: () => void
+    let replaceStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      replaceStarted = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      releaseReplace = resolve
+    })
+    const store: AccountStorageStore = {
+      load: async () => state,
+      saveMerged: async (_path, incoming) => {
+        state = mergeAccountStorage(state, incoming)
+        return state
+      },
+      mutate: async (_path, fn) => {
+        const next = (await fn(state)) ?? state
+        replaceStarted()
+        await gate
+        state = next
+        return state
+      },
+      clear: async () => {},
+    }
+    const manager = new AccountManager(undefined, stored, {
+      store,
+      now: () => 123,
+    })
+    manager.updateQuotaCache(1, {
+      gemini: { remainingFraction: 0.2, modelCount: 1 },
+    })
+    manager.removeAccountByIndex(0)
+    const replacement = manager.saveToDiskReplace()
+    await started
+    manager.updateQuotaCache(0, {
+      gemini: { remainingFraction: 0.9, modelCount: 1 },
+    })
+    releaseReplace()
+    await replacement
+    expect(state.accounts[0]?.cachedQuota?.gemini?.remainingFraction).toBe(0.2)
+    await manager.saveToDisk()
+    expect(state.accounts[0]?.cachedQuota?.gemini?.remainingFraction).toBe(0.9)
+  })
+
   it('persists and restores the cachedQuotaAccountId stamp across save→loadFromDisk', async () => {
     const seeded: AccountStorageV4 = {
       version: 4,
@@ -294,6 +396,7 @@ describe('core AccountManager', () => {
       gemini: { remainingFraction: 0.42, modelCount: 1 },
     })
     expect(persisted?.accounts[0]?.cachedQuotaAccountId).toBe(expectedStamp)
+    expect(persisted?.accounts[0]?.cachedQuotaSuccessAt).toBe(1_700_000_000_000)
 
     // Roundtrip: a fresh manager built from the persisted snapshot must
     // surface the same stamp on the same account (same refresh token).
@@ -302,6 +405,9 @@ describe('core AccountManager', () => {
       now: () => 1_700_000_001_000,
     })
     expect(reloaded.getAccounts()[0]?.cachedQuotaAccountId).toBe(expectedStamp)
+    expect(reloaded.getAccounts()[0]?.cachedQuotaSuccessAt).toBe(
+      1_700_000_000_000,
+    )
     // Stamp mismatch path: a roundtripped account whose stored stamp no
     // longer matches its current refresh token is dropped at projection
     // time (no quota rendered) — see `toCommandAccountRow` /
@@ -337,6 +443,172 @@ describe('core AccountManager', () => {
     expect(tamperedManager.getAccounts()[0]?.cachedQuotaAccountId).not.toBe(
       'deadbeefcafebabe',
     )
+  })
+
+  it('round-trips an empty successful quota snapshot through a merged save', async () => {
+    let state = stored
+    const store: AccountStorageStore = {
+      load: async () => state,
+      saveMerged: async (_path, incoming) => {
+        state = mergeAccountStorage(state, incoming)
+        return state
+      },
+      mutate: async (_path, fn) => {
+        state = (await fn(state)) ?? state
+        return state
+      },
+      clear: async () => {},
+    }
+    const manager = new AccountManager(undefined, stored, {
+      store,
+      now: () => 123,
+    })
+    manager.updateQuotaCache(0, {})
+    await manager.saveToDisk()
+    expect(state.accounts[0]?.cachedQuota).toEqual({})
+    expect(state.accounts[0]?.cachedQuotaSuccessAt).toBe(123)
+    const reloaded = new AccountManager(undefined, state, { store })
+    expect(reloaded.getAccounts()[0]?.cachedQuota).toEqual({})
+    expect(reloaded.getAccounts()[0]?.cachedQuotaSuccessAt).toBe(123)
+  })
+
+  it.each([
+    undefined,
+    0.2,
+  ])('preserves a later external quota success after unrelated manager save (initial %s)', async (initialFraction) => {
+    const initial: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        {
+          refreshToken: 'r1',
+          addedAt: 1,
+          lastUsed: 0,
+          ...(initialFraction === undefined
+            ? {}
+            : {
+                cachedQuota: {
+                  gemini: { remainingFraction: initialFraction, modelCount: 1 },
+                },
+                cachedQuotaAccountId: 'old-owner',
+                cachedQuotaUpdatedAt: 10,
+                cachedQuotaSuccessAt: 10,
+              }),
+        },
+      ],
+      activeIndex: 0,
+    }
+    let state = initial
+    const store: AccountStorageStore = {
+      load: async () => state,
+      saveMerged: async (_path, incoming) => {
+        state = mergeAccountStorage(state, incoming)
+        return state
+      },
+      mutate: async (_path, fn) => {
+        state = (await fn(state)) ?? state
+        return state
+      },
+      clear: async () => {},
+    }
+    const manager = new AccountManager(undefined, initial, {
+      store,
+      now: () => 30,
+    })
+    state = mergeAccountStorage(state, {
+      ...initial,
+      accounts: [
+        {
+          ...initial.accounts[0]!,
+          cachedQuota: { gemini: { remainingFraction: 0.8, modelCount: 1 } },
+          cachedQuotaAccountId: 'external-owner',
+          cachedQuotaUpdatedAt: 20,
+          cachedQuotaSuccessAt: 20,
+        },
+      ],
+    })
+
+    manager.getAccounts()[0]!.lastUsed = 30
+    await manager.saveToDisk()
+    expect(state.accounts[0]).toMatchObject({
+      lastUsed: 30,
+      cachedQuota: { gemini: { remainingFraction: 0.8, modelCount: 1 } },
+      cachedQuotaAccountId: 'external-owner',
+      cachedQuotaUpdatedAt: 20,
+      cachedQuotaSuccessAt: 20,
+    })
+
+    manager.updateQuotaCache(0, {})
+    await manager.saveToDisk()
+    expect(state.accounts[0]?.cachedQuota).toEqual({})
+    expect(state.accounts[0]?.cachedQuotaSuccessAt).toBe(30)
+    expect(state.accounts[0]?.cachedQuotaAccountId).not.toBe('external-owner')
+  })
+
+  it('keeps a quota update dirty when it happens during an in-flight save', async () => {
+    let state = stored
+    let releaseFirst!: () => void
+    let firstStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve
+    })
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    let saves = 0
+    const store: AccountStorageStore = {
+      load: async () => state,
+      saveMerged: async (_path, incoming) => {
+        if (++saves === 1) {
+          firstStarted()
+          await firstGate
+        }
+        state = mergeAccountStorage(state, incoming)
+        return state
+      },
+      mutate: async (_path, fn) => {
+        state = (await fn(state)) ?? state
+        return state
+      },
+      clear: async () => {},
+    }
+    const manager = new AccountManager(undefined, stored, {
+      store,
+      now: () => 123,
+    })
+    manager.updateQuotaCache(0, {
+      gemini: { remainingFraction: 0.2, modelCount: 1 },
+    })
+    const firstSave = manager.saveToDisk()
+    await started
+    manager.updateQuotaCache(0, {
+      gemini: { remainingFraction: 0.9, modelCount: 1 },
+    })
+    releaseFirst()
+    await firstSave
+    expect(state.accounts[0]?.cachedQuota?.gemini?.remainingFraction).toBe(0.2)
+    await manager.saveToDisk()
+    expect(state.accounts[0]?.cachedQuota?.gemini?.remainingFraction).toBe(0.9)
+    expect(saves).toBe(2)
+  })
+
+  it('does not infer cachedQuotaSuccessAt from a legacy attempt timestamp', () => {
+    const legacy: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        {
+          refreshToken: 'legacy',
+          addedAt: 1,
+          lastUsed: 0,
+          cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 1 } },
+          cachedQuotaUpdatedAt: 1_700_000_000_000,
+        },
+      ],
+      activeIndex: 0,
+    }
+    const manager = new AccountManager(undefined, legacy, {
+      store: createStore(legacy).store,
+    })
+    expect(manager.getAccounts()[0]?.cachedQuotaSuccessAt).toBeUndefined()
   })
 
   it('persists and restores the captured tier schema marker across save→loadFromDisk', async () => {

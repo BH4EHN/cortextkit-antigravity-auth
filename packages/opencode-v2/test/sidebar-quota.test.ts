@@ -31,7 +31,7 @@ function success(
 }
 
 describe('sidebar quota coordinator', () => {
-  test('legacy unstamped cache appears first and keeps its age after a failed fetch', async () => {
+  test('legacy attempt time does not become a quota-success timestamp', async () => {
     const accounts = [
       account('legacy', {
         cachedQuota: { gemini: { remainingFraction: 0.35, modelCount: 1 } },
@@ -58,9 +58,9 @@ describe('sidebar quota coordinator', () => {
     const initial = coordinator.snapshot('cache').accounts
     expect(initial[0]?.gemini).toMatchObject({
       remainingPercent: 35,
-      updatedAt: 12_000,
       source: 'cache',
     })
+    expect(Object.hasOwn(initial[0]!.gemini, 'updatedAt')).toBe(false)
     expect(initial[0]?.cacheUpdatedAt).toBe(12_000)
     expect(initial[1]?.gemini.remainingPercent).toBeNull()
     expect(initial[1]?.cacheUpdatedAt).toBeUndefined()
@@ -70,10 +70,10 @@ describe('sidebar quota coordinator', () => {
     const failed = coordinator.snapshot('cache').accounts
     expect(failed[0]?.gemini).toMatchObject({
       remainingPercent: 35,
-      updatedAt: 12_000,
       source: 'cache',
       refreshState: 'error',
     })
+    expect(Object.hasOwn(failed[0]!.gemini, 'updatedAt')).toBe(false)
     expect(failed[1]?.state).toBe('disabled')
     expect(calls).toBe(1)
     await coordinator.dispose()
@@ -115,6 +115,7 @@ describe('sidebar quota coordinator', () => {
         cachedQuota: { gemini: { remainingFraction: 0.2, modelCount: 1 } },
         cachedQuotaAccountId: quotaAccountIdentity('a'),
         cachedQuotaUpdatedAt: now,
+        cachedQuotaSuccessAt: now - 10_000,
       }),
     ]
     const coordinator = new SidebarQuotaCoordinator({
@@ -157,6 +158,7 @@ describe('sidebar quota coordinator', () => {
         cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 1 } },
         cachedQuotaAccountId: quotaAccountIdentity('a'),
         cachedQuotaUpdatedAt: old,
+        cachedQuotaSuccessAt: old - 5_000,
       }),
       account('b'),
     ]
@@ -187,7 +189,7 @@ describe('sidebar quota coordinator', () => {
     expect(calls).toEqual(['a', 'b'])
     expect(rows[0]?.gemini).toMatchObject({
       remainingPercent: 40,
-      updatedAt: old,
+      updatedAt: old - 5_000,
       refreshState: 'error',
     })
     expect(rows[1]?.nonGemini).toMatchObject({
@@ -200,6 +202,51 @@ describe('sidebar quota coordinator', () => {
     now += 60_000
     await coordinator.query('a', false)
     expect(calls).toHaveLength(3)
+    await coordinator.dispose()
+  })
+
+  test('automatic success updates memory success time and later failure preserves it', async () => {
+    let now = 100_000
+    let calls = 0
+    const persisted = account('a', {
+      cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 1 } },
+      cachedQuotaAccountId: quotaAccountIdentity('a'),
+      cachedQuotaUpdatedAt: 90_000,
+      cachedQuotaSuccessAt: 80_000,
+    })
+    const coordinator = new SidebarQuotaCoordinator({
+      accounts: () => [persisted],
+      active: () => ({ claude: 0, gemini: 0 }),
+      logicalToken: (token) => token,
+      now: () => now,
+      fetch: async () => {
+        calls += 1
+        return calls === 1
+          ? success({ gemini: { remainingFraction: 0.7, modelCount: 1 } })
+          : { index: 0, status: 'error', error: 'offline' }
+      },
+    })
+    const initial = coordinator.snapshot('cache').accounts[0]!
+    expect(initial.gemini.updatedAt).toBe(80_000)
+    expect(initial.cacheUpdatedAt).toBe(90_000)
+    await coordinator.query('a', true)
+    now = 110_000
+    const live = coordinator.snapshot('cache').accounts[0]!
+    expect(live.gemini).toMatchObject({
+      remainingPercent: 70,
+      source: 'live',
+      updatedAt: 100_000,
+    })
+    await coordinator.query('a', true)
+    const failed = coordinator.snapshot('cache').accounts[0]!
+    expect(failed.gemini).toMatchObject({
+      remainingPercent: 70,
+      source: 'live',
+      updatedAt: 100_000,
+      refreshState: 'error',
+    })
+    expect(failed.cacheUpdatedAt).toBe(90_000)
+    expect(persisted.cachedQuotaSuccessAt).toBe(80_000)
     await coordinator.dispose()
   })
 

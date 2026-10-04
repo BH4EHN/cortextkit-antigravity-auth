@@ -20,6 +20,7 @@ const accountRow = z.object({
   gemini: quotaCell,
   nonGemini: quotaCell,
   cacheUpdatedAt: z.number().optional(),
+  cacheSuccessAt: z.number().optional(),
 })
 
 const sidebarQuotaCell = quotaCell.extend({

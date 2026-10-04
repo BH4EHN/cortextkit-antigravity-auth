@@ -104,6 +104,7 @@ export interface ManagedAccount {
   /** Opaque identity of the refresh token that produced `cachedQuota`. */
   cachedQuotaAccountId?: string
   cachedQuotaUpdatedAt?: number
+  cachedQuotaSuccessAt?: number
   /**
    * Captured plan tier ID from the most recent `loadCodeAssist` response.
    * Raw upstream string (e.g. `"free-tier"`) — never normalised.
@@ -349,6 +350,10 @@ export class AccountManager {
   private savePending = false
   private saveTimeout: ReturnType<typeof setTimeout> | null = null
   private saveInFlight: Promise<void> | null = null
+  private saveQueue: Promise<void> = Promise.resolve()
+  private quotaRevision = 0
+  private quotaRevisionByToken = new Map<string, number>()
+  private savedQuotaRevisionByToken = new Map<string, number>()
   private disposed = false
   private persistenceStopped = false
   private savePromiseResolvers: Array<{
@@ -437,6 +442,7 @@ export class AccountManager {
             // for a different account after an index shift.
             cachedQuotaAccountId: acc.cachedQuotaAccountId,
             cachedQuotaUpdatedAt: acc.cachedQuotaUpdatedAt,
+            cachedQuotaSuccessAt: acc.cachedQuotaSuccessAt,
             capturedTierId: acc.capturedTierId,
             capturedPaidTierId: acc.capturedPaidTierId,
             capturedTierAt: acc.capturedTierAt,
@@ -1672,7 +1678,7 @@ export class AccountManager {
     return [...this.accounts]
   }
 
-  private buildStorageSnapshot(): AccountStorageV4 {
+  private buildStorageSnapshot(includeUnchangedQuota = true): AccountStorageV4 {
     const claudeIndex = Math.max(0, this.currentAccountIndexByFamily.claude)
     const geminiIndex = Math.max(0, this.currentAccountIndexByFamily.gemini)
 
@@ -1695,15 +1701,18 @@ export class AccountManager {
         fingerprintHistory: a.fingerprintHistory?.length
           ? a.fingerprintHistory
           : undefined,
-        cachedQuota:
-          a.cachedQuota && Object.keys(a.cachedQuota).length > 0
-            ? a.cachedQuota
-            : undefined,
-        // Persist the opaque identity stamp alongside the quota so a later
-        // loadFromDisk + projection can detect a stale snapshot captured
-        // for a different account after an index shift.
-        cachedQuotaAccountId: a.cachedQuotaAccountId,
-        cachedQuotaUpdatedAt: a.cachedQuotaUpdatedAt,
+        ...(includeUnchangedQuota ||
+        (this.quotaRevisionByToken.get(a.parts.refreshToken) ?? 0) >
+          (this.savedQuotaRevisionByToken.get(a.parts.refreshToken) ?? 0)
+          ? {
+              // Quota, identity, and success time form one replacement. An
+              // empty object is a successful snapshot, not a missing cache.
+              cachedQuota: a.cachedQuota,
+              cachedQuotaAccountId: a.cachedQuotaAccountId,
+              cachedQuotaUpdatedAt: a.cachedQuotaUpdatedAt,
+              cachedQuotaSuccessAt: a.cachedQuotaSuccessAt,
+            }
+          : {}),
         capturedTierId: a.capturedTierId,
         capturedPaidTierId: a.capturedPaidTierId,
         capturedTierAt: a.capturedTierAt,
@@ -1727,7 +1736,12 @@ export class AccountManager {
   }
 
   async saveToDisk(): Promise<void> {
-    await this.store.saveMerged(this.storagePath, this.buildStorageSnapshot())
+    await this.enqueueStorageSave(async () => {
+      const snapshot = this.buildStorageSnapshot(false)
+      const revisions = new Map(this.quotaRevisionByToken)
+      await this.store.saveMerged(this.storagePath, snapshot)
+      this.markQuotaRevisionsSaved(revisions)
+    })
   }
 
   /**
@@ -1736,8 +1750,56 @@ export class AccountManager {
    * mergeAccountStorage re-reading it from disk.
    */
   async saveToDiskReplace(): Promise<void> {
-    const snapshot = this.buildStorageSnapshot()
-    await this.store.mutate(this.storagePath, () => snapshot)
+    await this.enqueueStorageSave(async () => {
+      const snapshot = this.buildStorageSnapshot()
+      const revisions = new Map(this.quotaRevisionByToken)
+      const dirtyQuotaTokens = new Set(
+        snapshot.accounts
+          .filter(
+            (account) =>
+              (revisions.get(account.refreshToken) ?? 0) >
+              (this.savedQuotaRevisionByToken.get(account.refreshToken) ?? 0),
+          )
+          .map((account) => account.refreshToken),
+      )
+      await this.store.mutate(this.storagePath, (current) => {
+        const currentByToken = new Map(
+          current.accounts.map((account) => [account.refreshToken, account]),
+        )
+        return {
+          ...snapshot,
+          accounts: snapshot.accounts.map((account) => {
+            const persisted = currentByToken.get(account.refreshToken)
+            if (!persisted || dirtyQuotaTokens.has(account.refreshToken)) {
+              return account
+            }
+            // Membership comes from the replacement snapshot; an unchanged
+            // survivor's quota comes from the lock-held current record.
+            return {
+              ...account,
+              cachedQuota: persisted.cachedQuota,
+              cachedQuotaAccountId: persisted.cachedQuotaAccountId,
+              cachedQuotaUpdatedAt: persisted.cachedQuotaUpdatedAt,
+              cachedQuotaSuccessAt: persisted.cachedQuotaSuccessAt,
+            }
+          }),
+        }
+      })
+      this.markQuotaRevisionsSaved(revisions)
+    })
+  }
+
+  private enqueueStorageSave(save: () => Promise<void>): Promise<void> {
+    const result = this.saveQueue.then(save)
+    // A failed write remains dirty, but must not prevent the next attempt.
+    this.saveQueue = result.catch(() => {})
+    return result
+  }
+
+  private markQuotaRevisionsSaved(revisions: Map<string, number>): void {
+    for (const [token, revision] of revisions) {
+      this.savedQuotaRevisionByToken.set(token, revision)
+    }
   }
 
   requestSaveToDisk(): void {
@@ -1953,6 +2015,7 @@ export class AccountManager {
         expectedRefreshToken !== undefined)
     )
       return
+    const updatedAt = this.now()
     account.cachedQuota = quotaGroups
     // Stamp the cached quota with an opaque identity derived from the refresh
     // token so a later projection can detect a stale snapshot captured for
@@ -1960,7 +2023,12 @@ export class AccountManager {
     account.cachedQuotaAccountId = quotaAccountIdentity(
       account.parts.refreshToken,
     )
-    account.cachedQuotaUpdatedAt = this.now()
+    account.cachedQuotaUpdatedAt = updatedAt
+    account.cachedQuotaSuccessAt = updatedAt
+    this.quotaRevisionByToken.set(
+      account.parts.refreshToken,
+      ++this.quotaRevision,
+    )
   }
 
   /**

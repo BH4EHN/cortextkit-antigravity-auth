@@ -1,4 +1,5 @@
 import { describe, expect, it, mock } from 'bun:test'
+import { createHash } from 'node:crypto'
 import type { AuthOAuthResult } from '@opencode-ai/plugin'
 import type { AntigravityTokenExchangeResult } from '../antigravity/oauth'
 import type { AccountAccessService } from './account-access'
@@ -114,6 +115,117 @@ describe('parseOAuthCallbackInput', () => {
 })
 
 describe('createOAuthMethods', () => {
+  it('updates successful quota snapshots while preserving failed AGY snapshots', async () => {
+    const initial: AccountStorageV4 = {
+      version: 4,
+      activeIndex: 0,
+      accounts: [
+        {
+          refreshToken: 'refresh-a',
+          addedAt: 1,
+          lastUsed: 1,
+          cachedQuota: { gemini: { remainingFraction: 0.2, modelCount: 1 } },
+          cachedQuotaAccountId: 'old-a',
+          cachedQuotaUpdatedAt: 10,
+          cachedQuotaSuccessAt: 100,
+        },
+        {
+          refreshToken: 'refresh-b',
+          addedAt: 1,
+          lastUsed: 1,
+          cachedQuota: {
+            'non-gemini': { remainingFraction: 0.3, modelCount: 1 },
+          },
+          cachedQuotaAccountId: 'old-b',
+          cachedQuotaUpdatedAt: 20,
+          cachedQuotaSuccessAt: 200,
+        },
+        {
+          refreshToken: 'refresh-c',
+          addedAt: 1,
+          lastUsed: 1,
+          cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 1 } },
+          cachedQuotaAccountId: 'old-c',
+          cachedQuotaUpdatedAt: 30,
+          cachedQuotaSuccessAt: 300,
+        },
+      ],
+    }
+    const { service } = createAccountAccess(initial)
+    const menuResults = [
+      { mode: 'check' as const },
+      { mode: 'cancel' as const },
+    ]
+    const methods = createOAuthMethods({
+      client: { tui: { showToast: mock(async () => {}) } } as never,
+      providerId: 'google',
+      config: DEFAULT_CONFIG,
+      lifecycle: createLifecycle(),
+      accountAccess: service,
+      quotaManager: {
+        refreshAccounts: mock(async () => [
+          {
+            index: 0,
+            status: 'ok',
+            quota: { groups: {}, modelCount: 0 },
+          },
+          {
+            index: 1,
+            status: 'error',
+            error: 'request failed',
+            updatedAccount: {
+              refreshToken: 'refresh-b',
+              addedAt: 1,
+              lastUsed: 2,
+              capturedTierId: 'updated-despite-quota-error',
+            },
+          },
+          {
+            index: 2,
+            status: 'ok',
+            quota: {
+              groups: {
+                'non-gemini': { remainingFraction: 0.9, modelCount: 1 },
+              },
+              modelCount: 1,
+              error: 'AGY summary unavailable',
+            },
+          },
+        ]),
+        dispose: mock(async () => {}),
+      } as never,
+      dependencies: {
+        promptLoginMode: mock(
+          async () => menuResults.shift() ?? ({ mode: 'cancel' } as const),
+        ),
+        isHeadless: () => false,
+        shouldSkipLocalServer: () => true,
+      },
+    })
+
+    await methods[0]?.authorize?.({ noBrowser: 'true' })
+
+    const persisted = await service.loadAccounts()
+    const first = persisted?.accounts[0]
+    const second = persisted?.accounts[1]
+    expect(first?.cachedQuota).toEqual({})
+    expect(first?.cachedQuotaAccountId).toBe(
+      createHash('sha256').update('refresh-a').digest('hex').slice(0, 16),
+    )
+    expect(first?.cachedQuotaSuccessAt).toBe(first?.cachedQuotaUpdatedAt)
+    expect(second?.cachedQuota?.['non-gemini']?.remainingFraction).toBe(0.3)
+    expect(second?.cachedQuotaAccountId).toBe('old-b')
+    expect(second?.cachedQuotaSuccessAt).toBe(200)
+    expect(second?.cachedQuotaUpdatedAt).toBeGreaterThan(20)
+    expect(second?.capturedTierId).toBe('updated-despite-quota-error')
+
+    const third = persisted?.accounts[2]
+    expect(third?.cachedQuota?.gemini?.remainingFraction).toBe(0.4)
+    expect(third?.cachedQuotaAccountId).toBe('old-c')
+    expect(third?.cachedQuotaSuccessAt).toBe(300)
+    expect(third?.cachedQuotaUpdatedAt).toBeGreaterThan(30)
+  })
+
   it('persists each CLI account and replaces storage only for the first fresh account', async () => {
     const { service, persistCalls } = createAccountAccess()
     const callbackInputs = ['code-a', 'code-b']

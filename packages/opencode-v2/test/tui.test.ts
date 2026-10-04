@@ -1,6 +1,7 @@
 import { describe, expect, jest, test } from 'bun:test'
 import { RGBA, TextAttributes } from '@opentui/core'
 import { testRender } from '@opentui/solid'
+import { jsx } from '@opentui/solid/jsx-runtime'
 import { createSignal } from 'solid-js'
 import type { SidebarQuotaSnapshot } from '../src/rpc.ts'
 import { tui } from '../src/tui.tsx'
@@ -24,7 +25,10 @@ function setup(
   rpcResults: {
     run?:
       | Record<string, unknown>
-      | ((input: { name: string; args: string }) => Record<string, unknown>)
+      | ((input: {
+          name: string
+          args: string
+        }) => Record<string, unknown> | Promise<Record<string, unknown>>)
     operation?:
       | Record<string, unknown>
       | (() => Promise<Record<string, unknown>>)
@@ -32,7 +36,12 @@ function setup(
       | SidebarQuotaSnapshot
       | ((input: { mode: 'cache' | 'ensure' }) => Promise<SidebarQuotaSnapshot>)
   } = {},
-  dataOptions: { syncSession?: () => Promise<void> } = {},
+  dataOptions: {
+    syncSession?: (sessionID: string) => Promise<void>
+    defaultDirectory?: string
+    directory?: string
+    sessionDirectories?: Record<string, string>
+  } = {},
   themeOverride?: unknown,
 ) {
   let currentRoute = route
@@ -43,33 +52,81 @@ function setup(
   const navigations: unknown[] = []
   let panelOpenCount = 0
   const calls: Array<{ name: string; args: string }> = []
+  const toastCalls: unknown[] = []
   const sidebarCalls: Array<'cache' | 'ensure'> = []
+  const rpcLocations: Array<{
+    method: 'run' | 'operation' | 'sidebarQuota'
+    directory: string | undefined
+  }> = []
   const sessions = new Map<
     string,
-    { model?: { providerID: string; id: string } }
+    {
+      model?: { providerID: string; id: string }
+      location?: { directory: string }
+    }
   >()
+  const sessionLocationSetters = new Map<string, (directory: string) => void>()
+  for (const [sessionID, directory] of Object.entries(
+    dataOptions.sessionDirectories ?? {},
+  )) {
+    const [getDirectory, setDirectory] = createSignal(directory)
+    sessionLocationSetters.set(sessionID, setDirectory)
+    sessions.set(sessionID, {
+      location: {
+        get directory() {
+          return getDirectory()
+        },
+      },
+    })
+  }
+  const [currentDirectory, setCurrentDirectory] = createSignal(
+    dataOptions.directory ?? '/workspace/current',
+  )
+  const defaultDirectory = dataOptions.defaultDirectory ?? '/workspace/default'
   const listeners = new Set<(event: unknown) => void>()
   let renderSidebar: ((input: { sessionID: string }) => unknown) | undefined
   const ctx = {
     client: {
       rpc: () => ({
-        sidebarQuota: async (input: { mode: 'cache' | 'ensure' }) => {
+        sidebarQuota: async (
+          input: { mode: 'cache' | 'ensure' },
+          options?: { location?: { directory: string } },
+        ) => {
+          rpcLocations.push({
+            method: 'sidebarQuota',
+            directory: options?.location?.directory,
+          })
           sidebarCalls.push(input.mode)
           const result = rpcResults.sidebarQuota
           return typeof result === 'function'
             ? result(input)
             : (result ?? { accounts: [], notices: [] })
         },
-        run: async (input: { name: string; args: string }) => {
+        run: async (
+          input: { name: string; args: string },
+          options?: { location?: { directory: string } },
+        ) => {
+          rpcLocations.push({
+            method: 'run',
+            directory: options?.location?.directory,
+          })
           calls.push(input)
           return typeof rpcResults.run === 'function'
             ? rpcResults.run(input)
             : (rpcResults.run ?? { messages: ['Done'] })
         },
-        operation: async () =>
-          typeof rpcResults.operation === 'function'
+        operation: async (
+          _input: { operationId: string },
+          options?: { location?: { directory: string } },
+        ) => {
+          rpcLocations.push({
+            method: 'operation',
+            directory: options?.location?.directory,
+          })
+          return typeof rpcResults.operation === 'function'
             ? rpcResults.operation()
-            : (rpcResults.operation ?? { state: 'complete', messages: [] }),
+            : (rpcResults.operation ?? { state: 'complete', messages: [] })
+        },
       }),
     },
     keymap: {
@@ -110,12 +167,16 @@ function setup(
           }) => unknown
         return () => {}
       },
-      toast: { show: () => {} },
+      toast: { show: (input: unknown) => toastCalls.push(input) },
+    },
+    get location() {
+      return { directory: currentDirectory() }
     },
     data: {
+      location: { default: () => ({ directory: defaultDirectory }) },
       session: {
         get: (id: string) => sessions.get(id),
-        sync: async () => dataOptions.syncSession?.(),
+        sync: async (sessionID: string) => dataOptions.syncSession?.(sessionID),
       },
       on: (_type: string, handler: (event: unknown) => void) => {
         listeners.add(handler)
@@ -140,6 +201,7 @@ function setup(
   return {
     commands: layers[0]!().commands,
     calls,
+    toastCalls,
     layers,
     get panel() {
       return panel?.name
@@ -165,8 +227,30 @@ function setup(
       return renderSidebar
     },
     sidebarCalls,
+    rpcLocations,
+    setLocation(directory: string) {
+      setCurrentDirectory(directory)
+    },
+    setSessionLocation(sessionID: string, directory: string) {
+      let setDirectory = sessionLocationSetters.get(sessionID)
+      if (!setDirectory) {
+        const [getDirectory, set] = createSignal(directory)
+        setDirectory = set
+        sessionLocationSetters.set(sessionID, set)
+        sessions.set(sessionID, {
+          ...sessions.get(sessionID),
+          location: {
+            get directory() {
+              return getDirectory()
+            },
+          },
+        })
+      }
+      setDirectory(directory)
+    },
     selectModel(sessionID: string, model?: { providerID: string; id: string }) {
-      sessions.set(sessionID, { model })
+      const current = sessions.get(sessionID)
+      sessions.set(sessionID, { model, location: current?.location })
       for (const listener of listeners)
         listener({
           type: 'session.model.selected',
@@ -346,6 +430,139 @@ describe('OpenCode 2 TUI slash commands', () => {
       expect(mounted.navigations).toEqual([])
     } finally {
       await mounted.cleanup?.()
+    }
+  })
+
+  test('routes run and operation RPCs through the initiating session directory', async () => {
+    let resolveOperation!: (result: Record<string, unknown>) => void
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-a' },
+      {
+        run: { messages: [], operationId: 'login-a' },
+        operation: () =>
+          new Promise((resolve) => {
+            resolveOperation = resolve
+          }),
+      },
+      { sessionDirectories: { 'session-a': '/workspace/session-a' } },
+    )
+    try {
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-account')!
+        .run('login')
+      mounted.setLocation('/workspace/other')
+      resolveOperation({ state: 'complete', messages: ['Login complete'] })
+      await Bun.sleep(0)
+      expect(mounted.rpcLocations).toEqual([
+        { method: 'run', directory: '/workspace/session-a' },
+        { method: 'operation', directory: '/workspace/session-a' },
+      ])
+    } finally {
+      await mounted.cleanup?.()
+    }
+  })
+
+  test('a newer run invalidates the previous operation poll', async () => {
+    let resolveOperation!: (result: Record<string, unknown>) => void
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: (input) =>
+          input.name === 'account'
+            ? { messages: ['Old login'], operationId: 'login-old' }
+            : { messages: ['New status'] },
+        operation: () =>
+          new Promise((resolve) => {
+            resolveOperation = resolve
+          }),
+      },
+    )
+    try {
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-account')!
+        .run('login')
+      await Bun.sleep(0)
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-status')!
+        .run()
+      resolveOperation({ state: 'complete', messages: ['Stale login result'] })
+      await Bun.sleep(0)
+      expect(
+        mounted.rpcLocations.filter(({ method }) => method === 'run'),
+      ).toEqual([
+        { method: 'run', directory: '/workspace/current' },
+        { method: 'run', directory: '/workspace/current' },
+      ])
+      expect(
+        mounted.rpcLocations.find(({ method }) => method === 'operation'),
+      ).toEqual({
+        method: 'operation',
+        directory: '/workspace/current',
+      })
+      expect(mounted.calls).toEqual([
+        { name: 'account', args: 'login' },
+        { name: 'status', args: '' },
+      ])
+    } finally {
+      await mounted.cleanup?.()
+    }
+  })
+
+  test('unload ignores a run result that arrives later', async () => {
+    let resolveRun!: (result: Record<string, unknown>) => void
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: () =>
+          new Promise((resolve) => {
+            resolveRun = resolve
+          }),
+      },
+    )
+    const pending = mounted.commands
+      .find((command) => command.slash?.name === 'antigravity-account')!
+      .run('login')
+    await Bun.sleep(0)
+    mounted.cleanup?.()
+    resolveRun({ messages: ['Late login'], operationId: 'late-operation' })
+    await pending
+    expect(
+      mounted.rpcLocations.filter(({ method }) => method === 'operation'),
+    ).toEqual([])
+    expect(mounted.toastCalls).toEqual([])
+  })
+
+  test('unload clears polling and ignores a late terminal failure', async () => {
+    let resolveOperation!: (result: Record<string, unknown>) => void
+    const setIntervalSpy = jest.spyOn(globalThis, 'setInterval')
+    const clearIntervalSpy = jest.spyOn(globalThis, 'clearInterval')
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: { messages: [], operationId: 'unloaded-operation' },
+        operation: () =>
+          new Promise((resolve) => {
+            resolveOperation = resolve
+          }),
+      },
+    )
+    try {
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-account')!
+        .run('login')
+      const timer = setIntervalSpy.mock.results.at(-1)?.value
+      expect(timer).toBeDefined()
+      mounted.cleanup?.()
+      expect(clearIntervalSpy).toHaveBeenCalledWith(timer)
+      resolveOperation({ state: 'failed', messages: ['Late failure'] })
+      await Bun.sleep(0)
+      expect(
+        mounted.rpcLocations.filter(({ method }) => method === 'operation'),
+      ).toHaveLength(1)
+      expect(mounted.toastCalls).toEqual([])
+    } finally {
+      setIntervalSpy.mockRestore()
+      clearIntervalSpy.mockRestore()
     }
   })
 
@@ -708,6 +925,53 @@ describe('OpenCode 2 TUI slash commands', () => {
 })
 
 describe('OpenCode 2 quota sidebar', () => {
+  test('same-session directory changes refresh RPC scope and fence stale sync completion', async () => {
+    const syncResolvers: Array<{ resolve: () => void; reject: () => void }> = []
+    const mounted = setup(
+      { type: 'session', sessionID: 'same-session' },
+      { sidebarQuota: sidebarSnapshot(62) },
+      {
+        directory: '/workspace/first',
+        sessionDirectories: { 'same-session': '/workspace/first' },
+        syncSession: () =>
+          new Promise<void>((resolve, reject) =>
+            syncResolvers.push({ resolve, reject }),
+          ),
+      },
+    )
+    mounted.selectModel('same-session', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'same-session' }) as never,
+      { width: 40, height: 24 },
+    )
+    try {
+      await Bun.sleep(0)
+      mounted.setSessionLocation('same-session', '/workspace/second')
+      await Bun.sleep(0)
+      expect(syncResolvers).toHaveLength(2)
+      syncResolvers[0]!.reject()
+      syncResolvers[1]!.resolve()
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(
+        mounted.rpcLocations.filter(({ method }) => method === 'sidebarQuota'),
+      ).toEqual([
+        { method: 'sidebarQuota', directory: '/workspace/first' },
+        { method: 'sidebarQuota', directory: '/workspace/first' },
+        { method: 'sidebarQuota', directory: '/workspace/second' },
+        { method: 'sidebarQuota', directory: '/workspace/second' },
+      ])
+      expect(rendered.captureCharFrame()).toContain('62%')
+      expect(rendered.captureCharFrame()).not.toContain('Could not load')
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
   test('falls back to base text color when semantic theme colors are absent', async () => {
     const snapshot = sidebarSnapshot(20)
     const baseColor = RGBA.fromInts(238, 238, 238)
@@ -733,12 +997,14 @@ describe('OpenCode 2 quota sidebar', () => {
       await Bun.sleep(0)
       await rendered.flush()
       const spans = rendered.captureSpans().lines.flatMap((line) => line.spans)
-      const find = (text: string) => spans.find((span) => span.text === text)!
-      expect(find('› Gemini').fg.toInts()).toEqual([238, 238, 238, 255])
-      expect(find(': 20%').fg.toInts()).toEqual([238, 238, 238, 255])
+      const find = (text: string) =>
+        spans.find((span) => span.text.includes(text))!
+      expect(find('Gm 5h').fg.toInts()).toEqual([238, 238, 238, 255])
+      expect(find(' 20%').fg.toInts()).toEqual([238, 238, 238, 255])
+      expect(find(' Default').fg.toInts()).toEqual([128, 128, 128, 255])
       expect(
         spans.find((span) => span.text.includes('5h'))!.fg.toInts(),
-      ).toEqual([128, 128, 128, 255])
+      ).toEqual([238, 238, 238, 255])
     } finally {
       await mounted.cleanup?.()
       rendered.renderer.destroy()
@@ -747,11 +1013,17 @@ describe('OpenCode 2 quota sidebar', () => {
 
   test('keeps severity, exact percentages, and selected styling across boundaries', async () => {
     const snapshot = sidebarSnapshot(0)
+    const summaryReset = Date.now() + 59 * 60_000
     const cells = [
-      [0, 1],
-      [9, 10],
+      [0, 5],
       [19, 20],
-      [100, null],
+      [21, 39],
+      [40, 50],
+      [59, 60],
+      [90, 94],
+      [95, 98],
+      [99, 100],
+      [null, null],
     ] as const
     snapshot.accounts = cells.map(([gemini, claude], index) => {
       const base = snapshot.accounts[index % snapshot.accounts.length]!
@@ -764,6 +1036,8 @@ describe('OpenCode 2 quota sidebar', () => {
         gemini: {
           ...base.gemini,
           remainingPercent: gemini,
+          resetAt: summaryReset,
+          windows: [],
           refreshState: refreshState as
             | 'refreshing'
             | 'error'
@@ -773,6 +1047,8 @@ describe('OpenCode 2 quota sidebar', () => {
         nonGemini: {
           ...base.nonGemini,
           remainingPercent: claude,
+          resetAt: summaryReset,
+          windows: [],
           refreshState: refreshState as
             | 'refreshing'
             | 'error'
@@ -792,56 +1068,87 @@ describe('OpenCode 2 quota sidebar', () => {
     const rendered = await testRender(
       () =>
         mounted.renderSidebar!({ sessionID: 'session-boundaries' }) as never,
-      { width: 32, height: 52 },
+      { width: 32, height: 100 },
     )
     try {
       await Bun.sleep(0)
       await rendered.flush()
       const frame = rendered.captureCharFrame()
-      for (const expected of [
-        'Gemini: 0% ▲ Empty',
-        'Claude/other: 1% ▲ Low',
-        'Gemini: 9% ▲ Low',
-        'Claude/other: 10% ▲ Low',
-        'Gemini: 19% ▲ Low',
-        'Claude/other: 20%',
-        'Gemini: 100%',
-        'Claude/other: —',
-      ])
-        expect(frame).toContain(expected)
+      const frameLines = frame.split('\n')
+      const quotaRows = frameLines.filter((line) => /^(Gm|NG) /.test(line))
+      const expectedRows: Array<['Gm' | 'NG', number | null]> = cells.flatMap(
+        ([gemini, nonGemini]) => [
+          ['Gm', gemini],
+          ['NG', nonGemini],
+        ],
+      )
+      const expectedBars = [
+        '▱▱▱▱▱▱▱▱▱▱',
+        '▰▱▱▱▱▱▱▱▱▱',
+        '▰▰▱▱▱▱▱▱▱▱',
+        '▰▰▱▱▱▱▱▱▱▱',
+        '▰▰▱▱▱▱▱▱▱▱',
+        '▰▰▰▰▱▱▱▱▱▱',
+        '▰▰▰▰▱▱▱▱▱▱',
+        '▰▰▰▰▰▱▱▱▱▱',
+        '▰▰▰▰▰▰▱▱▱▱',
+        '▰▰▰▰▰▰▱▱▱▱',
+        '▰▰▰▰▰▰▰▰▰▱',
+        '▰▰▰▰▰▰▰▰▰▱',
+        '▰▰▰▰▰▰▰▰▰▰',
+        '▰▰▰▰▰▰▰▰▰▰',
+        '▰▰▰▰▰▰▰▰▰▰',
+        '▰▰▰▰▰▰▰▰▰▰',
+        '──────────',
+        '──────────',
+      ]
+      expect(quotaRows).toHaveLength(expectedRows.length)
+      for (const [index, [label, value]] of expectedRows.entries()) {
+        const line = quotaRows[index]!
+        const percent =
+          value === null ? '   —' : `${String(value).padStart(3)}%`
+        expect(line.startsWith(`${label} `)).toBe(true)
+        expect(line.slice(6, 16)).toBe(expectedBars[index]!)
+        const rightStart = 32 - 11
+        expect(line.slice(rightStart, rightStart + 4)).toBe(percent)
+        expect(line[rightStart + 4]).toBe(' ')
+        expect(line.slice(rightStart + 5, 32).trim()).toMatch(/^(?:5[89]m|1h)$/)
+      }
       expect(frame).toContain('refresh')
       expect(frame).toContain('failed')
       expect(frame).toContain('N/A')
+      const cacheRows = frameLines
+        .map((line, index) => ({ line, index }))
+        .filter(({ line }) => line.includes('Cached'))
+      expect(cacheRows).toHaveLength(cells.length * 2 - 1)
+      for (const { index } of cacheRows)
+        expect(frameLines[index - 1]).toMatch(/^(Gm|NG) /)
 
       const spans = rendered.captureSpans()
       const textSpans = spans.lines.flatMap((line) => line.spans)
-      const windowRow = spans.lines.find((line) =>
-        line.spans.some((span) => span.text === '    5h '),
-      )!.spans
-      expect(windowRow.find((span) => span.text === '0%')!.fg.toInts()).toEqual(
-        [224, 108, 117, 255],
-      )
-      expect(
-        windowRow.find((span) => span.text.includes(' · 59m'))!.fg.toInts(),
-      ).toEqual([128, 128, 128, 255])
       const find = (value: string) =>
         textSpans.find((span) => span.text.includes(value))!
       const rgb = (value: string) => find(value).fg.toInts()
-      expect(rgb('› Claude/other')).toEqual([250, 178, 131, 255])
-      expect(find('› Claude/other').attributes).toBe(TextAttributes.BOLD)
-      expect(rgb(': 1% ▲ Low')).toEqual([224, 108, 117, 255])
-      expect(rgb(': 9% ▲ Low')).toEqual([224, 108, 117, 255])
-      expect(rgb(': 10% ▲ Low')).toEqual([245, 167, 66, 255])
-      expect(rgb(': 19% ▲ Low')).toEqual([245, 167, 66, 255])
-      expect(rgb(': 20%')).toEqual([127, 216, 143, 255])
-      expect(rgb(': 0% ▲ Empty')).toEqual([224, 108, 117, 255])
-      expect(rgb('█')).toEqual([224, 108, 117, 255])
-      expect(rgb('░░░░░░░░')).toEqual([128, 128, 128, 255])
-      expect(rgb('████████')).toEqual([127, 216, 143, 255])
-      expect(rgb('──────── Cached')).toEqual([128, 128, 128, 255])
-      expect(frame.indexOf('Gemini: 0%')).toBeLessThan(
-        frame.indexOf('Claude/other: 1%'),
-      )
+      expect(rgb('NG')).toEqual([250, 178, 131, 255])
+      expect(find('NG').attributes).toBe(TextAttributes.BOLD)
+      expect(rgb('0%')).toEqual([224, 108, 117, 255])
+      expect(rgb('19%')).toEqual([224, 108, 117, 255])
+      expect(rgb('20%')).toEqual([224, 108, 117, 255])
+      expect(rgb('21%')).toEqual([245, 167, 66, 255])
+      expect(rgb('50%')).toEqual([245, 167, 66, 255])
+      expect(rgb('59%')).toEqual([127, 216, 143, 255])
+      expect(rgb('60%')).toEqual([127, 216, 143, 255])
+      expect(rgb('99%')).toEqual([127, 216, 143, 255])
+      expect(rgb('100%')).toEqual([127, 216, 143, 255])
+      expect(rgb('▱▱▱▱▱▱▱▱▱▱')).toEqual([224, 108, 117, 255])
+      expect(rgb('▰▱▱▱▱▱▱▱▱▱')).toEqual([224, 108, 117, 255])
+      expect(rgb('▰▰▱▱▱▱▱▱▱▱')).toEqual([224, 108, 117, 255])
+      expect(rgb('▰▰▰▰▱▱▱▱▱▱')).toEqual([245, 167, 66, 255])
+      expect(rgb('▰▰▰▰▰▰▱▱▱▱')).toEqual([127, 216, 143, 255])
+      expect(rgb('▰▰▰▰▰▰▰▰▰▱')).toEqual([127, 216, 143, 255])
+      expect(rgb('▰▰▰▰▰▰▰▰▰▰')).toEqual([127, 216, 143, 255])
+      expect(rgb('──────────')).toEqual([128, 128, 128, 255])
+      expect(frame.indexOf('Gm')).toBeLessThan(frame.indexOf('NG'))
     } finally {
       await mounted.cleanup?.()
       rendered.renderer.destroy()
@@ -871,14 +1178,17 @@ describe('OpenCode 2 quota sidebar', () => {
       await Bun.sleep(0)
       await rendered.flush()
       let frame = rendered.captureCharFrame()
-      expect(frame).toContain('Antigravity quota')
-      expect(frame).toContain('2 accounts · Gemini')
+      expect(frame).toContain('Antigravity')
+      expect(frame).toContain('remaining')
+      expect(frame).toContain('2 accounts · remaining')
+      expect(frame).toContain('Gemini')
       expect(frame).toContain('Default account')
       expect(frame).toContain('Disabled account')
-      expect(frame).toContain('Gemini: 63%')
-      expect(frame).toContain('Claude/other: 0%')
-      expect(frame).toContain('Gemini: —')
-      expect(frame).toContain('Weekly 14%')
+      expect(frame).toContain('Gm 5h')
+      expect(frame).toContain('NG 5h')
+      expect(frame).toContain('Gm 7d')
+      expect(frame).toContain('63%')
+      expect(frame).toContain('14%')
       expect(frame).toContain('Default')
       expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
 
@@ -887,8 +1197,8 @@ describe('OpenCode 2 quota sidebar', () => {
         id: 'claude-sonnet-4-6-thinking',
       })
       await rendered.flush()
-      expect(rendered.captureCharFrame()).toContain('Claude/other: 0%')
-      expect(rendered.captureCharFrame()).toContain('2 accounts · Claude/other')
+      expect(rendered.captureCharFrame()).toContain('NG 5h')
+      expect(rendered.captureCharFrame()).toContain('Claude/other')
       expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
 
       mounted.selectModel('session-1', {
@@ -897,7 +1207,7 @@ describe('OpenCode 2 quota sidebar', () => {
       })
       await rendered.flush()
       frame = rendered.captureCharFrame()
-      expect(frame).not.toContain('Antigravity quota')
+      expect(frame).not.toContain('Antigravity')
 
       mounted.selectModel('session-2', {
         providerID: 'google',
@@ -905,7 +1215,7 @@ describe('OpenCode 2 quota sidebar', () => {
       })
       setActiveSession('session-2')
       await rendered.flush()
-      expect(rendered.captureCharFrame()).toContain('Antigravity quota')
+      expect(rendered.captureCharFrame()).toContain('Antigravity')
       expect(mounted.sidebarCalls).toEqual([
         'cache',
         'ensure',
@@ -915,6 +1225,282 @@ describe('OpenCode 2 quota sidebar', () => {
     } finally {
       await mounted.cleanup?.()
       rendered.renderer.destroy()
+    }
+  })
+
+  test('deduplicates idle metadata only within matching account groups', async () => {
+    const snapshot = sidebarSnapshot(63)
+    snapshot.accounts[1] = {
+      ...snapshot.accounts[1]!,
+      gemini: { ...snapshot.accounts[1]!.gemini, source: 'live' },
+    }
+    snapshot.accounts.push({
+      ...snapshot.accounts[0]!,
+      label: 'Different timestamp account',
+      gemini: { ...snapshot.accounts[0]!.gemini, updatedAt: Date.now() },
+    })
+    snapshot.accounts.push({
+      ...snapshot.accounts[0]!,
+      label: 'Mixed refresh account',
+      gemini: { ...snapshot.accounts[0]!.gemini, refreshState: 'idle' },
+      nonGemini: {
+        ...snapshot.accounts[0]!.nonGemini,
+        refreshState: 'unavailable',
+      },
+    })
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-metadata' },
+      { sidebarQuota: snapshot },
+    )
+    mounted.selectModel('session-metadata', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-metadata' }) as never,
+      { width: 40, height: 44 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const lines = rendered.captureCharFrame().split('\n')
+      const cachedDetails = lines.filter((line) => line.includes('Cached ·'))
+      expect(cachedDetails).toHaveLength(6)
+      expect(lines.filter((line) => line.includes('Live ·'))).toHaveLength(1)
+      expect(lines.filter((line) => line.includes('N/A'))).toHaveLength(1)
+      const accountLines = lines.filter((line) =>
+        line.includes('Mixed refresh account'),
+      )
+      expect(accountLines).toHaveLength(1)
+      const accountIndex = lines.indexOf(accountLines[0]!)
+      expect(
+        lines
+          .slice(accountIndex + 1)
+          .filter((line) => line.includes('Cached ·')),
+      ).toHaveLength(2)
+      expect(
+        lines.slice(accountIndex + 1).filter((line) => line.includes('N/A')),
+      ).toHaveLength(1)
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('shows local success time and wraps long age at the measured slot width', async () => {
+    jest.setSystemTime(new Date(2026, 9, 3, 6, 32))
+    const snapshot = sidebarSnapshot(63)
+    const successAt = new Date(2026, 9, 1, 6, 34).getTime()
+    const localSuccess = new Date(successAt)
+    const expectedDate = `${String(localSuccess.getMonth() + 1).padStart(2, '0')}-${String(localSuccess.getDate()).padStart(2, '0')} ${String(localSuccess.getHours()).padStart(2, '0')}:${String(localSuccess.getMinutes()).padStart(2, '0')}`
+    snapshot.accounts = [
+      {
+        ...snapshot.accounts[0]!,
+        gemini: { ...snapshot.accounts[0]!.gemini, updatedAt: successAt },
+        nonGemini: { ...snapshot.accounts[0]!.nonGemini, updatedAt: successAt },
+      },
+    ]
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-success-time' },
+      { sidebarQuota: snapshot },
+    )
+    mounted.selectModel('session-success-time', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () =>
+        mounted.renderSidebar!({ sessionID: 'session-success-time' }) as never,
+      { width: 32, height: 24 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const lines = rendered.captureCharFrame().split('\n')
+      const metadataIndex = lines.findIndex((line) =>
+        line.includes(`Cached · ${expectedDate}`),
+      )
+      expect(metadataIndex).toBeGreaterThanOrEqual(0)
+      expect(lines[metadataIndex]!.trim()).toBe(`Cached · ${expectedDate}`)
+      expect(lines[metadataIndex + 1]!.trim()).toBe('47h58m ago')
+      expect(lines.filter((line) => line.includes(expectedDate))).toHaveLength(
+        1,
+      )
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      jest.useRealTimers()
+    }
+  })
+
+  test('unknown or invalid success timestamps never invent an attempt time', async () => {
+    const snapshot = sidebarSnapshot(63)
+    const unknown = {
+      ...snapshot.accounts[0]!,
+      gemini: { ...snapshot.accounts[0]!.gemini, updatedAt: undefined },
+      nonGemini: { ...snapshot.accounts[0]!.nonGemini, updatedAt: undefined },
+    }
+    const invalid = {
+      ...snapshot.accounts[0]!,
+      label: 'Invalid timestamp account',
+      gemini: { ...snapshot.accounts[0]!.gemini, updatedAt: Number.MAX_VALUE },
+      nonGemini: {
+        ...snapshot.accounts[0]!.nonGemini,
+        updatedAt: Number.MAX_VALUE,
+      },
+    }
+    snapshot.accounts = [unknown, invalid]
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-unknown-time' },
+      { sidebarQuota: snapshot },
+    )
+    mounted.selectModel('session-unknown-time', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () =>
+        mounted.renderSidebar!({ sessionID: 'session-unknown-time' }) as never,
+      { width: 40, height: 32 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const frame = rendered.captureCharFrame()
+      expect(frame.match(/Cached · update unknown/g)).toHaveLength(2)
+      expect(frame).not.toContain('Infinity')
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
+  test('keeps compact rows readable at narrow sidebar widths', async () => {
+    for (const { outerWidth, slotWidth } of [
+      { outerWidth: 32, slotWidth: 32 },
+      { outerWidth: 40, slotWidth: 40 },
+      { outerWidth: 120, slotWidth: 32 },
+    ]) {
+      const snapshot = sidebarSnapshot(63)
+      snapshot.accounts[1] = {
+        ...snapshot.accounts[1]!,
+        label: 'Disabled account',
+        state: 'disabled',
+        current: 'both',
+        gemini: { ...snapshot.accounts[1]!.gemini, windows: [] },
+        nonGemini: {
+          ...snapshot.accounts[1]!.nonGemini,
+          windows: [],
+          resetAt: Date.now() + 47 * 60 * 60_000 + 59 * 60_000,
+        },
+      }
+      snapshot.accounts.push(
+        {
+          ...snapshot.accounts[1]!,
+          label: 'Verification Required Account',
+          state: 'verification-required',
+          current: 'both',
+          gemini: {
+            ...snapshot.accounts[1]!.gemini,
+            windows: [],
+            resetAt: Date.now() + 59 * 60_000,
+          },
+        },
+        {
+          ...snapshot.accounts[1]!,
+          label: 'Ineligible Account Long',
+          state: 'ineligible',
+          current: 'both',
+          nonGemini: {
+            ...snapshot.accounts[1]!.nonGemini,
+            resetAt: undefined,
+          },
+        },
+      )
+      const sessionID = `sidebar-width-${outerWidth}-${slotWidth}`
+      const mounted = setup(
+        { type: 'session', sessionID },
+        { sidebarQuota: snapshot },
+      )
+      mounted.selectModel(sessionID, {
+        providerID: 'google',
+        id: 'gemini-3.8-flash',
+      })
+      const rendered = await testRender(
+        () => {
+          const sidebar = mounted.renderSidebar!({ sessionID })
+          return outerWidth === slotWidth
+            ? (sidebar as never)
+            : (jsx('box', { width: slotWidth, children: sidebar }) as never)
+        },
+        { width: outerWidth, height: 40 },
+      )
+      try {
+        await Bun.sleep(0)
+        await rendered.flush()
+        const frame = rendered.captureCharFrame()
+        const lines = frame.split('\n')
+        const headerIndex = lines.findIndex((line) =>
+          line.includes('Antigravity'),
+        )
+        expect(headerIndex).toBeGreaterThanOrEqual(0)
+        const header = lines[headerIndex]!.slice(0, slotWidth)
+        expect(header.trimEnd().endsWith('Gemini')).toBe(true)
+        expect(header.indexOf('Gemini')).toBe(slotWidth - 'Gemini'.length)
+        expect(lines[headerIndex + 1]).toContain('accounts · remaining')
+        for (const [label, status] of [
+          ['Default account', 'ACTIVE Default'],
+          ['Disabled', 'DISABLED Default'],
+          ['Verification', 'VERIFY Default'],
+          ['Ineligible', 'INELIGIBLE Default'],
+        ] as const) {
+          expect(
+            lines.some((line) => line.includes(label) && line.includes(status)),
+          ).toBe(true)
+        }
+        expect(frame).toContain('Gm 5h')
+        expect(frame).toContain('NG 7d')
+        const quotaRows = lines.filter((line) => /^(Gm|NG) /.test(line))
+        expect(quotaRows.length).toBeGreaterThan(0)
+        const rightStart = slotWidth - 11
+        for (const line of quotaRows) {
+          expect(line.slice(6, 16)).toMatch(/^(?:[▰▱]){10}|^─{10}$/)
+          const percent = line.slice(rightStart, rightStart + 4)
+          expect(percent.endsWith('%') || percent.endsWith('—')).toBe(true)
+          expect(line[rightStart + 4]).toBe(' ')
+          const reset = line.slice(slotWidth - 6, slotWidth).trim()
+          if (reset)
+            expect(line.slice(slotWidth - reset.length, slotWidth)).toBe(reset)
+          if (percent.endsWith('%'))
+            expect(line.indexOf('%')).toBe(slotWidth - 8)
+          expect(line).not.toMatch(/[│╭╮╰╯┌┐└┘]/)
+        }
+        const resetLabels = quotaRows
+          .map((line) => line.slice(slotWidth - 6, slotWidth).trim())
+          .filter(Boolean)
+        expect(resetLabels.some((label) => /^47h5[89]m$/.test(label))).toBe(
+          true,
+        )
+        expect(resetLabels.some((label) => /^(?:59m|1h)$/.test(label))).toBe(
+          true,
+        )
+        expect(resetLabels.some((label) => /^[34]d$/.test(label))).toBe(true)
+        const noReset = quotaRows.find(
+          (line) =>
+            line.startsWith('NG   ') &&
+            !line.slice(slotWidth - 6, slotWidth).trim(),
+        )!
+        expect(noReset.slice(rightStart, rightStart + 4)).toBe(' 22%')
+        expect(noReset.slice(slotWidth - 6, slotWidth).trim()).toBe('')
+        for (const { index } of lines
+          .map((line, index) => ({ line, index }))
+          .filter(({ line }) => line.includes('Cached')))
+          expect(lines[index - 1]).toMatch(/^(Gm|NG) /)
+        await saveCapture(`sidebar-${outerWidth}-${slotWidth}`, rendered)
+      } finally {
+        await mounted.cleanup?.()
+        rendered.renderer.destroy()
+      }
     }
   })
 
@@ -942,7 +1528,7 @@ describe('OpenCode 2 quota sidebar', () => {
     try {
       await Bun.sleep(0)
       await rendered.flush()
-      expect(rendered.captureCharFrame()).toContain('Gemini: 41%')
+      expect(rendered.captureCharFrame()).toContain('41%')
       mounted.selectModel('session-2', {
         providerID: 'openai',
         id: 'other-model',
@@ -951,7 +1537,7 @@ describe('OpenCode 2 quota sidebar', () => {
       await Bun.sleep(0)
       await rendered.flush()
       const hiddenFrame = rendered.captureCharFrame()
-      expect(hiddenFrame).not.toContain('Antigravity quota')
+      expect(hiddenFrame).not.toContain('Antigravity')
       expect(hiddenFrame).not.toContain('99%')
     } finally {
       await mounted.cleanup?.()
@@ -981,8 +1567,9 @@ describe('OpenCode 2 quota sidebar', () => {
       await Bun.sleep(0)
       await rendered.flush()
       const frame = rendered.captureCharFrame()
-      expect(frame).toContain('Gemini: 27%')
-      expect(frame).toContain('Cached 1m')
+      expect(frame).toContain('27%')
+      expect(frame).toContain('Cached ·')
+      expect(frame).toContain(' ago')
       expect(frame).toContain('Quota refresh failed')
       expect(frame).not.toContain('sensitive transport detail')
     } finally {
@@ -1038,7 +1625,7 @@ describe('OpenCode 2 quota sidebar', () => {
       resolveEnsures[0]!(sidebarSnapshot(30, 'live'))
       await Bun.sleep(0)
       await rendered.flush()
-      expect(rendered.captureCharFrame()).toContain('Gemini: 30%')
+      expect(rendered.captureCharFrame()).toContain('30%')
       pollCallbacks[0]!()
       await Bun.sleep(0)
       expect(mounted.sidebarCalls).toEqual(['cache', 'ensure', 'ensure'])
@@ -1046,7 +1633,7 @@ describe('OpenCode 2 quota sidebar', () => {
       resolveEnsures[1]!(sidebarSnapshot(45, 'live'))
       await Bun.sleep(0)
       await rendered.flush()
-      expect(rendered.captureCharFrame()).toContain('Gemini: 45%')
+      expect(rendered.captureCharFrame()).toContain('45%')
     } finally {
       rendered.renderer.destroy()
       await mounted.cleanup?.()
@@ -1104,7 +1691,7 @@ describe('OpenCode 2 quota sidebar', () => {
     try {
       await Bun.sleep(0)
       await rendered.flush()
-      expect(rendered.captureCharFrame()).not.toContain('Antigravity quota')
+      expect(rendered.captureCharFrame()).not.toContain('Antigravity')
       expect(mounted.sidebarCalls).toEqual([])
       mounted.selectModel('session-3', {
         providerID: 'google',

@@ -72,6 +72,7 @@ interface AccountFixture {
   cachedQuota?: QuotaGroupFixture
   cachedQuotaUpdatedAt?: number
   cachedQuotaAccountId?: string
+  cachedQuotaSuccessAt?: number
   accountIneligible?: boolean
   coolingDownUntil?: number
   healthScore?: number
@@ -160,6 +161,7 @@ function makeHarness(options: {
         | undefined,
       cachedQuotaUpdatedAt: entry.cachedQuotaUpdatedAt,
       cachedQuotaAccountId: entry.cachedQuotaAccountId,
+      cachedQuotaSuccessAt: entry.cachedQuotaSuccessAt,
       accountIneligible: entry.accountIneligible,
     })),
   }
@@ -227,6 +229,7 @@ function makeHarness(options: {
           | undefined,
         cachedQuotaUpdatedAt: entry.cachedQuotaUpdatedAt,
         cachedQuotaAccountId: entry.cachedQuotaAccountId,
+        cachedQuotaSuccessAt: entry.cachedQuotaSuccessAt,
         accountIneligible: entry.accountIneligible,
         coolingDownUntil: entry.coolingDownUntil,
         healthScore: entry.healthScore,
@@ -260,6 +263,7 @@ function makeHarness(options: {
       account.cachedQuota = groups as QuotaGroupFixture | undefined
       account.cachedQuotaAccountId = quotaAccountIdentity(account.refreshToken)
       account.cachedQuotaUpdatedAt = Date.now()
+      account.cachedQuotaSuccessAt = account.cachedQuotaUpdatedAt
     },
     requestSaveToDisk() {
       saveCalls.count += 1
@@ -619,6 +623,7 @@ describe('createCommandDataService', () => {
           label: 'Alpha',
           cachedQuota: { 'non-gemini': { remainingFraction: 0.1 } },
           cachedQuotaUpdatedAt: 1,
+          cachedQuotaSuccessAt: 10,
         }),
         makeAccountFixture({
           refreshToken: 'refresh-b',
@@ -689,6 +694,20 @@ describe('createCommandDataService', () => {
           },
         },
       ],
+      [
+        'refresh-b',
+        {
+          index: 1,
+          status: 'ok',
+          quota: {
+            groups: {
+              gemini: { remainingFraction: 0.99, modelCount: 1 },
+            },
+            modelCount: 1,
+            error: 'AGY summary unavailable',
+          },
+        },
+      ],
     ])
 
     const harness = makeHarness({
@@ -704,6 +723,8 @@ describe('createCommandDataService', () => {
           label: 'Beta',
           cachedQuota: { gemini: { remainingFraction: 0.05 } },
           cachedQuotaUpdatedAt: 1,
+          cachedQuotaAccountId: 'prior-b',
+          cachedQuotaSuccessAt: 20,
         }),
       ],
       refreshResults,
@@ -722,6 +743,9 @@ describe('createCommandDataService', () => {
         ?.remainingFraction,
     ).toBe(0.7)
     expect(harness.storage.accounts[0]?.cachedQuotaUpdatedAt).toBeGreaterThan(1)
+    expect(harness.storage.accounts[0]?.cachedQuotaSuccessAt).toBe(
+      harness.storage.accounts[0]?.cachedQuotaUpdatedAt,
+    )
     // The refreshed account's persisted snapshot must carry the identity
     // stamp derived from its refresh token — pins the P1#1 fix that
     // propagates `cachedQuotaAccountId` through `buildStorageSnapshot`.
@@ -732,6 +756,8 @@ describe('createCommandDataService', () => {
     expect(
       harness.storage.accounts[1]?.cachedQuota?.gemini?.remainingFraction,
     ).toBe(0.05)
+    expect(harness.storage.accounts[1]?.cachedQuotaSuccessAt).toBe(20)
+    expect(harness.storage.accounts[1]?.cachedQuotaAccountId).toBe('prior-b')
   })
 
   it('refreshQuota() writes a label-only sidebar snapshot carrying the fresh percentages', async () => {

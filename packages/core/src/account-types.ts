@@ -90,6 +90,8 @@ export interface AccountMetadataV3 {
     resetTime?: string
   }[]
   cachedQuotaUpdatedAt?: number
+  /** Epoch ms when the cached quota snapshot was last successfully fetched. */
+  cachedQuotaSuccessAt?: number
   /**
    * Captured plan tier ID from the most recent `loadCodeAssist` response.
    * Raw upstream string (e.g. `"free-tier"`) — never normalised.

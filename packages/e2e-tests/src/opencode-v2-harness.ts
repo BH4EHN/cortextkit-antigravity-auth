@@ -1,4 +1,5 @@
-import { execFileSync, spawn } from 'node:child_process'
+import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { createRequire } from 'node:module'
@@ -42,6 +43,24 @@ export interface OpenCodeV2Harness {
   dispose(): Promise<void>
 }
 
+export interface OpenCodeV2RpcResponse {
+  status: number
+  body: unknown
+}
+
+export interface OpenCodeV2RpcRoutingHarness {
+  readonly baseUrl: string
+  readonly projectDirectory: string
+  readonly accountsFile: string
+  readonly databaseFile: string
+  request(
+    method: 'sidebarQuota' | 'run',
+    input: { mode: 'cache' } | { name: 'quota'; args: '' },
+    directory?: string,
+  ): Promise<OpenCodeV2RpcResponse>
+  dispose(): Promise<void>
+}
+
 const MOCK_PROJECT_ID = 'opencode-v2-e2e-project'
 
 function asRecord(value: unknown): Record<string, unknown> {
@@ -70,6 +89,231 @@ function close(server: Server): Promise<void> {
   return new Promise((resolvePromise) => {
     server.close(() => resolvePromise())
   })
+}
+
+async function unusedLoopbackPort(): Promise<number> {
+  const server = createServer()
+  const port = await listen(server)
+  await close(server)
+  return port
+}
+
+async function stopChild(child: ChildProcess): Promise<void> {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return
+  const exited = new Promise<void>((resolvePromise) => {
+    child.once('exit', () => resolvePromise())
+  })
+  child.kill('SIGTERM')
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const stopped = await Promise.race([
+    exited.then(() => true),
+    new Promise<boolean>((resolvePromise) => {
+      timer = setTimeout(() => resolvePromise(false), 3_000)
+      timer.unref()
+    }),
+  ])
+  if (timer) clearTimeout(timer)
+  if (!stopped && child.exitCode === null && child.signalCode === null) {
+    child.kill('SIGKILL')
+    await exited
+  }
+}
+
+function asJson(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return text
+  }
+}
+
+function rpcExecutable(override?: string): string {
+  if (override) return resolve(override)
+  const configuredOverride = process.env.ANTIGRAVITY_OPENCODE_V2_E2E_EXECUTABLE
+  if (configuredOverride) return resolve(configuredOverride)
+  const require = createRequire(import.meta.url)
+  const cliPackage = require.resolve('@opencode-ai/cli/package.json')
+  const platformPackage = `@opencode-ai/cli-${process.platform}-${process.arch}`
+  const platformPackageJson = createRequire(cliPackage).resolve(
+    `${platformPackage}/package.json`,
+  )
+  return join(
+    resolve(platformPackageJson, '..'),
+    'bin',
+    process.platform === 'win32' ? 'opencode2.exe' : 'opencode2',
+  )
+}
+
+export async function createOpenCodeV2RpcRoutingHarness(
+  options: { executable?: string; accountPool?: 'empty' | 'disabled' } = {},
+): Promise<OpenCodeV2RpcRoutingHarness> {
+  const testRoot = process.env.ANTIGRAVITY_TEST_ROOT
+  if (!testRoot) throw new Error('ANTIGRAVITY_TEST_ROOT is not set')
+
+  const root = join(testRoot, 'opencode-v2-rpc-routing')
+  const paths = {
+    home: join(root, 'home'),
+    globalConfig: join(root, 'global-config'),
+    data: join(root, 'data'),
+    state: join(root, 'state'),
+    cache: join(root, 'cache'),
+    runtime: join(root, 'runtime'),
+    temp: join(root, 'tmp'),
+    serverCwd: join(root, 'server-cwd'),
+    project: join(root, 'project-with-plugin'),
+  }
+  for (const directory of Object.values(paths)) {
+    mkdirSync(directory, { recursive: true, mode: 0o700 })
+  }
+  execFileSync('git', ['init', '-q'], { cwd: paths.serverCwd })
+  execFileSync('git', ['init', '-q'], { cwd: paths.project })
+
+  const config = {
+    $schema: 'https://opencode.ai/config.json',
+    providers: {
+      google: {
+        name: 'Google',
+        package: '@opencode-ai/ai/providers/google',
+        settings: { apiKey: 'opencode-v2-rpc-synthetic-key' },
+      },
+    },
+  }
+  const globalConfigFile = join(paths.globalConfig, 'opencode.json')
+  writeFileSync(globalConfigFile, `${JSON.stringify(config, null, 2)}\n`, {
+    mode: 0o600,
+  })
+
+  const pluginPackage = resolve('packages/opencode-v2')
+  writeFileSync(
+    join(paths.project, 'opencode.json'),
+    `${JSON.stringify(
+      {
+        $schema: 'https://opencode.ai/config.json',
+        plugins: [pluginPackage],
+      },
+      null,
+      2,
+    )}\n`,
+    { mode: 0o600 },
+  )
+
+  const accountsFile = join(paths.data, 'antigravity-accounts.json')
+  const accounts =
+    options.accountPool === 'disabled'
+      ? [
+          {
+            refreshToken: 'synthetic-rpc-disabled-account',
+            projectId: 'synthetic-rpc-project',
+            addedAt: 1,
+            lastUsed: 0,
+            enabled: false,
+            rateLimitResetTimes: {},
+          },
+        ]
+      : []
+  writeFileSync(
+    accountsFile,
+    `${JSON.stringify({ version: 4, accounts, activeIndex: 0 }, null, 2)}\n`,
+    { mode: 0o600 },
+  )
+  const databaseFile = join(paths.data, 'opencode-v2-rpc-e2e.db')
+  const password = `synthetic-${randomBytes(24).toString('hex')}`
+  const auth = Buffer.from(`opencode:${password}`).toString('base64')
+  const environment: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: paths.home,
+    USERPROFILE: paths.home,
+    XDG_CONFIG_HOME: join(paths.globalConfig, 'xdg'),
+    XDG_DATA_HOME: paths.data,
+    XDG_STATE_HOME: paths.state,
+    XDG_CACHE_HOME: paths.cache,
+    XDG_RUNTIME_DIR: paths.runtime,
+    TMPDIR: paths.temp,
+    PWD: paths.serverCwd,
+    INIT_CWD: paths.serverCwd,
+    OPENCODE_CONFIG_DIR: paths.globalConfig,
+    OPENCODE_DB: databaseFile,
+    ANTIGRAVITY_ACCOUNTS_FILE: accountsFile,
+    OPENCODE_DISABLE_DEFAULT_PLUGINS: 'true',
+    OPENCODE_PASSWORD: password,
+  }
+  delete environment.OPENCODE_SERVER
+  delete environment.OPENCODE_SERVER_PASSWORD
+  delete environment.SERVER_PASSWORD
+  delete environment.OPENCODE_CONFIG_CONTENT
+
+  const port = await unusedLoopbackPort()
+  const baseUrl = `http://127.0.0.1:${port}`
+  let child: ChildProcess | undefined
+  try {
+    child = spawn(
+      rpcExecutable(options.executable),
+      ['serve', '--hostname', '127.0.0.1', '--port', String(port)],
+      {
+        cwd: paths.serverCwd,
+        env: environment,
+        stdio: 'ignore',
+      },
+    )
+    let spawnError: Error | undefined
+    child.on('error', (error) => {
+      spawnError = error
+    })
+    const authorization = `Basic ${auth}`
+    const deadline = Date.now() + 20_000
+    let ready = false
+    while (Date.now() < deadline) {
+      if (spawnError) throw spawnError
+      if (child.exitCode !== null || child.signalCode !== null) {
+        throw new Error('OpenCode 2 RPC host exited before readiness')
+      }
+      try {
+        const response = await fetch(`${baseUrl}/global/health`, {
+          headers: { authorization },
+          signal: AbortSignal.timeout(1_000),
+        })
+        await response.body?.cancel()
+        if (response.status === 200) {
+          ready = true
+          break
+        }
+      } catch {
+        // The host has not bound its loopback listener yet.
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100))
+    }
+    if (!ready) throw new Error('OpenCode 2 RPC host did not become ready')
+
+    return {
+      baseUrl,
+      projectDirectory: paths.project,
+      accountsFile,
+      databaseFile,
+      async request(method, input, directory) {
+        const url = new URL(
+          `/api/rpc/cortexkit.antigravity-auth/${method}`,
+          baseUrl,
+        )
+        if (directory) url.searchParams.set('location[directory]', directory)
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            authorization,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({ input }),
+        })
+        const body = await response.text()
+        return { status: response.status, body: asJson(body) }
+      },
+      async dispose() {
+        await stopChild(child!)
+      },
+    }
+  } catch (error) {
+    if (child) await stopChild(child)
+    throw error
+  }
 }
 
 function readBody(

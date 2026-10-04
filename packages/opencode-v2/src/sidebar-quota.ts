@@ -57,14 +57,19 @@ function cellFromQuotaGroup(
     const timestamp = value ? Date.parse(value) : Number.NaN
     return Number.isFinite(timestamp) ? timestamp : undefined
   }
-  return {
-    remainingPercent: percent(group.remainingFraction),
-    resetAt: resetAt(group.resetTime),
-    windows: (group.windows ?? []).map((window) => ({
+  const windows = (group.windows ?? []).map((window) => {
+    const windowResetAt = resetAt(window.resetTime)
+    return {
       name: window.window,
       remainingPercent: percent(window.remainingFraction),
-      resetAt: resetAt(window.resetTime),
-    })),
+      ...(windowResetAt !== undefined ? { resetAt: windowResetAt } : {}),
+    }
+  })
+  const groupResetAt = resetAt(group.resetTime)
+  return {
+    remainingPercent: percent(group.remainingFraction),
+    ...(groupResetAt !== undefined ? { resetAt: groupResetAt } : {}),
+    windows,
   }
 }
 
@@ -108,7 +113,7 @@ export class SidebarQuotaCoordinator {
       const group = (cell: PanelQuotaCell): GroupState => ({
         cell: cacheValid ? cell : { remainingPercent: null, windows: [] },
         source: 'cache',
-        updatedAt: cacheValid ? row.cacheUpdatedAt : undefined,
+        updatedAt: cacheValid ? row.cacheSuccessAt : undefined,
       })
       entry = {
         groups: { gemini: group(row.gemini), nonGemini: group(row.nonGemini) },
@@ -137,7 +142,9 @@ export class SidebarQuotaCoordinator {
         return {
           ...value.cell,
           source: value.source,
-          updatedAt: value.updatedAt,
+          ...(value.updatedAt !== undefined
+            ? { updatedAt: value.updatedAt }
+            : {}),
           refreshState: this.pending.has(key)
             ? 'refreshing'
             : entry.error
@@ -149,7 +156,9 @@ export class SidebarQuotaCoordinator {
       }
       return {
         ...row,
-        cacheUpdatedAt: cacheValid ? row.cacheUpdatedAt : undefined,
+        ...(cacheValid && row.cacheUpdatedAt !== undefined
+          ? { cacheUpdatedAt: row.cacheUpdatedAt }
+          : {}),
         gemini: cell('gemini'),
         nonGemini: cell('nonGemini'),
       }
