@@ -631,14 +631,22 @@ export const tui = {
         })
 
         const group = () => quotaGroupForAntigravityModel(model())
+        const isDefaultForGroup = (
+          account: SidebarQuotaSnapshot['accounts'][number],
+          selectedGroup: 'gemini' | 'non-gemini',
+        ) =>
+          selectedGroup === 'gemini'
+            ? account.current === 'gemini' || account.current === 'both'
+            : account.current === 'claude' || account.current === 'both'
         const accountState = (state: string) =>
           state === 'verification-required' ? 'VERIFY' : state.toUpperCase()
         const accountLabel = (
           account: SidebarQuotaSnapshot['accounts'][number],
+          selectedGroup: 'gemini' | 'non-gemini',
         ) => {
           const statusWidth =
             accountState(account.state).length +
-            (account.current !== 'none' ? 8 : 0)
+            (isDefaultForGroup(account, selectedGroup) ? 8 : 0)
           const maxWidth = Math.max(1, sidebarWidth() - 1 - statusWidth)
           return account.label.length > maxWidth
             ? `${account.label.slice(0, maxWidth - 1)}…`
@@ -701,7 +709,7 @@ export const tui = {
                               attributes={TextAttributes.BOLD}
                               flexShrink={1}
                             >
-                              {accountLabel(account)}
+                              {accountLabel(account, selectedGroup())}
                             </text>
                             <box flexDirection='row'>
                               <text
@@ -713,7 +721,12 @@ export const tui = {
                               >
                                 {accountState(account.state)}
                               </text>
-                              <Show when={account.current !== 'none'}>
+                              <Show
+                                when={isDefaultForGroup(
+                                  account,
+                                  selectedGroup(),
+                                )}
+                              >
                                 <text fg={theme().textMuted}> Default</text>
                               </Show>
                             </box>

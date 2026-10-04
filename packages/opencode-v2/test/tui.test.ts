@@ -1405,6 +1405,89 @@ describe('OpenCode 2 quota sidebar', () => {
     }
   })
 
+  test('matches Default badge and narrow label space to the selected account group', async () => {
+    const base = sidebarSnapshot(41).accounts[0]!
+    const snapshot = sidebarSnapshot(41)
+    snapshot.accounts = [
+      {
+        ...base,
+        label: 'Gemini Account With Long Name',
+        current: 'gemini',
+      },
+      {
+        ...base,
+        label: 'Claude Account With Long Name',
+        current: 'claude',
+      },
+      {
+        ...base,
+        label: 'Both Account With Long Name',
+        current: 'both',
+      },
+      {
+        ...base,
+        label: 'No Current Account With Long Name',
+        current: 'none',
+      },
+    ]
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-default-group' },
+      { sidebarQuota: snapshot },
+    )
+    mounted.selectModel('session-default-group', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () =>
+        mounted.renderSidebar!({
+          sessionID: 'session-default-group',
+        }) as never,
+      { width: 36, height: 50 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const linesFor = (frame: string, prefix: string) =>
+        frame.split('\n').filter((line) => line.includes(prefix))
+      let frame = rendered.captureCharFrame()
+      let gemini = linesFor(frame, 'Gemini Account')[0]!
+      let claude = linesFor(frame, 'Claude Account')[0]!
+      let both = linesFor(frame, 'Both Account')[0]!
+      let none = linesFor(frame, 'No Current')[0]!
+      expect(gemini).toContain('Default')
+      expect(claude).not.toContain('Default')
+      expect(both).toContain('Default')
+      expect(none).not.toContain('Default')
+      expect(gemini).toContain('…')
+      expect(gemini).not.toContain('Long Name')
+      expect(claude).toContain('Long Name')
+
+      mounted.selectModel('session-default-group', {
+        providerID: 'google',
+        id: 'claude-sonnet-4-6-thinking',
+      })
+      await rendered.flush()
+      frame = rendered.captureCharFrame()
+      gemini = linesFor(frame, 'Gemini Account')[0]!
+      claude = linesFor(frame, 'Claude Account')[0]!
+      both = linesFor(frame, 'Both Account')[0]!
+      none = linesFor(frame, 'No Current')[0]!
+      expect(gemini).not.toContain('Default')
+      expect(claude).toContain('Default')
+      expect(both).toContain('Default')
+      expect(none).not.toContain('Default')
+      expect(claude).toContain('…')
+      expect(claude).not.toContain('Long Name')
+      expect(gemini).toContain('Long Name')
+      expect(frame).toContain('Gm 5h')
+      expect(frame).toContain('NG 5h')
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+    }
+  })
+
   test('deduplicates idle metadata only within matching account groups', async () => {
     const snapshot = sidebarSnapshot(63)
     snapshot.accounts[1] = {
