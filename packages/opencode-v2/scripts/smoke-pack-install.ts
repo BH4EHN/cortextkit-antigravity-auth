@@ -316,7 +316,7 @@ async function verifyInstalledTui(
     })
     let frame = await settle(rendered)
     assertContains(frame, '63% remaining', 'quota card')
-    assertContains(frame, 'resets ', 'quota reset')
+    assertContains(frame, 'reset in ', 'quota reset')
     if (
       !rpcLocations.some(
         ({ method, directory }) =>
@@ -465,7 +465,11 @@ async function verifyInstalledTui(
     )
       throw new Error('Installed sidebar RPC omitted its session directory')
     assertContains(frame, 'Packed sidebar account', 'sidebar cache')
-    assertContains(frame, '1 account · remaining', 'sidebar account summary')
+    assertContains(
+      frame,
+      '1 account · remaining / reset in',
+      'sidebar account summary',
+    )
     assertContains(frame, 'Gemini', 'sidebar selected-group header')
     assertContains(frame, 'Gm 5h', 'sidebar cache')
     assertContains(frame, 'NG 7d', 'sidebar windows')

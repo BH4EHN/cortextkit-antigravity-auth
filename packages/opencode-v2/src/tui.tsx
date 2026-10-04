@@ -227,7 +227,7 @@ export const tui = {
                     ? 'no data'
                     : `${window.remainingPercent}%`}
                   {window.resetAt !== undefined
-                    ? ` · resets ${relative(window.resetAt - now())}`
+                    ? ` · reset in ${resetCountdown(window.resetAt - now())}`
                     : ''}
                 </text>
               )}
@@ -235,7 +235,7 @@ export const tui = {
             {props.cell.windows.length === 0 &&
             props.cell.resetAt !== undefined ? (
               <text fg={theme().textMuted}>
-                Resets {relative(props.cell.resetAt - now())}
+                Reset in {resetCountdown(props.cell.resetAt - now())}
               </text>
             ) : null}
           </box>
@@ -286,7 +286,7 @@ export const tui = {
             <text fg={theme().textMuted}>
               Quota cache:{' '}
               {props.account.cacheUpdatedAt !== undefined
-                ? `${relative(now() - props.account.cacheUpdatedAt)} ago`
+                ? relativeAge(now() - props.account.cacheUpdatedAt)
                 : 'not available'}
             </text>
           </box>
@@ -325,7 +325,7 @@ export const tui = {
             <text>
               {cacheAge() === null
                 ? 'Never refreshed'
-                : `Oldest enabled account cache: ${relative(cacheAge()!)} ago`}
+                : `Oldest enabled account cache: ${relativeAge(cacheAge()!)}`}
             </text>
             <text fg={theme().accent} marginTop={1}>
               Files
@@ -362,9 +362,7 @@ export const tui = {
           ? `${source} · ${String(timestamp.getMonth() + 1).padStart(2, '0')}-${String(timestamp.getDate()).padStart(2, '0')} ${String(timestamp.getHours()).padStart(2, '0')}:${String(timestamp.getMinutes()).padStart(2, '0')}`
           : `${source} · update unknown`
         const suffix = [
-          validTimestamp
-            ? `${relative(now() - cell.updatedAt!)} ago`
-            : undefined,
+          validTimestamp ? relativeAge(now() - cell.updatedAt!) : undefined,
           state,
         ].filter((part): part is string => part !== undefined)
         if (suffix.length === 0) return [base]
@@ -385,7 +383,7 @@ export const tui = {
         const percentageText = (percentage = value()) =>
           percentage === null ? '   —' : `${String(percentage).padStart(3)}%`
         const resetText = (resetAt?: number) =>
-          resetAt === undefined ? undefined : relative(resetAt - now())
+          resetAt === undefined ? undefined : resetCountdown(resetAt - now())
         const barText = (percentage = value()) => {
           if (percentage === null) return '──────────'
           const filled =
@@ -775,7 +773,7 @@ export const tui = {
                 <text fg={theme().textMuted}>
                   {wrapText(
                     data()
-                      ? `${data()!.accounts.length} ${data()!.accounts.length === 1 ? 'account' : 'accounts'} · remaining`
+                      ? quotaSummary(data()!.accounts.length)
                       : 'Loading quota…',
                     sidebarWidth(),
                   )}
@@ -1088,6 +1086,25 @@ function wrapText(value: string, width: number): string {
   }
   if (line) lines.push(line)
   return lines.join('\n')
+}
+
+function quotaSummary(accountCount: number): string {
+  const noun = accountCount === 1 ? 'account' : 'accounts'
+  return `${accountCount} ${noun} · remaining / reset in`
+}
+
+function relativeAge(ms: number): string {
+  const elapsed = Math.max(0, ms)
+  return elapsed < 60_000 ? 'just now' : `${relative(elapsed)} ago`
+}
+
+function resetCountdown(ms: number): string {
+  const minutes = Math.floor(Math.max(0, ms) / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h${minutes % 60}m`
+  const days = Math.floor(hours / 24)
+  return `${days}d${hours % 24}h`
 }
 
 function relative(ms: number): string {

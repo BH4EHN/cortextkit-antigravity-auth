@@ -830,7 +830,7 @@ describe('OpenCode 2 TUI slash commands', () => {
       await Bun.sleep(0)
       await rendered.flush()
       expect(rendered.captureCharFrame()).toContain(
-        'Oldest enabled account cache: 0m ago',
+        'Oldest enabled account cache: just now',
       )
 
       now += 60_000
@@ -848,6 +848,110 @@ describe('OpenCode 2 TUI slash commands', () => {
       rendered.renderer.destroy()
       intervalSpy.mockRestore()
       dateNowSpy.mockRestore()
+    }
+  })
+
+  test('status cache ages switch from just now to elapsed units at minute boundaries', async () => {
+    jest.setSystemTime(new Date(2026, 9, 4, 12, 34))
+    let ageMs = 0
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: () => ({
+          messages: [],
+          snapshot: {
+            kind: 'status',
+            pool: {
+              total: 0,
+              enabled: 0,
+              disabled: 0,
+              ineligible: 0,
+              verificationRequired: 0,
+            },
+            current: { claude: null, gemini: null },
+            quotaCache: { oldestAgeMs: ageMs },
+            paths: { accountsFile: '/accounts.json', logFile: '/log.txt' },
+          },
+        }),
+      },
+    )
+    const rendered = await testRender(() => mounted.renderPage!() as never, {
+      width: 80,
+      height: 30,
+    })
+    try {
+      const status = mounted.commands.find(
+        (command) => command.slash?.name === 'antigravity-status',
+      )!
+      for (const [age, label] of [
+        [0, 'just now'],
+        [59_999, 'just now'],
+        [60_000, '1m ago'],
+        [3_599_999, '59m ago'],
+        [3_600_000, '1h ago'],
+      ] as const) {
+        ageMs = age
+        await status.run()
+        await Bun.sleep(0)
+        await rendered.flush()
+        expect(rendered.captureCharFrame()).toContain(
+          `Oldest enabled account cache: ${label}`,
+        )
+      }
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      jest.useRealTimers()
+    }
+  })
+
+  test('account quota cache age shows just now below one minute', async () => {
+    jest.setSystemTime(new Date(2026, 9, 4, 12, 34))
+    let ageMs = 0
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: () => ({
+          messages: [],
+          snapshot: {
+            kind: 'quota',
+            accounts: [
+              {
+                label: 'Account 1',
+                state: 'active',
+                current: 'both',
+                gemini: { remainingPercent: null, windows: [] },
+                nonGemini: { remainingPercent: null, windows: [] },
+                cacheUpdatedAt: Date.now() - ageMs,
+              },
+            ],
+          },
+        }),
+      },
+    )
+    const rendered = await testRender(() => mounted.renderPage!() as never, {
+      width: 80,
+      height: 30,
+    })
+    try {
+      const quota = mounted.commands.find(
+        (command) => command.slash?.name === 'antigravity-quota',
+      )!
+      for (const [age, label] of [
+        [0, 'just now'],
+        [59_999, 'just now'],
+        [60_000, '1m ago'],
+      ] as const) {
+        ageMs = age
+        await quota.run()
+        await Bun.sleep(0)
+        await rendered.flush()
+        expect(rendered.captureCharFrame()).toContain(`Quota cache: ${label}`)
+      }
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      jest.useRealTimers()
     }
   })
 
@@ -919,8 +1023,8 @@ describe('OpenCode 2 TUI slash commands', () => {
         expect(frame).toContain('ACTIVE')
         expect(frame).toContain('Current · Claude + Gemini')
         expect(frame).toContain('63% remaining')
-        expect(frame).toContain('5h · 63% · resets 59m')
-        expect(frame).toContain('Weekly · 8% · resets 6d')
+        expect(frame).toContain('5h · 63% · reset in 59m')
+        expect(frame).toContain('Weekly · 8% · reset in 6d0h')
         expect(frame).toContain('Quota cache: 2m ago')
         expect(frame).not.toContain('Resets')
         expect(frame).toContain('┌')
@@ -1022,7 +1126,7 @@ describe('OpenCode 2 TUI slash commands', () => {
       await Bun.sleep(0)
       await rendered.flush()
       const frame = rendered.captureCharFrame()
-      expect(frame).toContain('Resets 0m')
+      expect(frame).toContain('Reset in 0m')
       expect(frame).not.toContain('Quota cache: not available')
     } finally {
       await mounted.cleanup?.()
@@ -1289,7 +1393,9 @@ describe('OpenCode 2 quota sidebar', () => {
         const rightStart = 32 - 11
         expect(line.slice(rightStart, rightStart + 4)).toBe(percent)
         expect(line[rightStart + 4]).toBe(' ')
-        expect(line.slice(rightStart + 5, 32).trim()).toMatch(/^(?:5[89]m|1h)$/)
+        expect(line.slice(rightStart + 5, 32).trim()).toMatch(
+          /^(?:5[89]m|1h0m)$/,
+        )
       }
       expect(frame).toContain('refresh')
       expect(frame).toContain('failed')
@@ -1485,6 +1591,83 @@ describe('OpenCode 2 quota sidebar', () => {
     } finally {
       await mounted.cleanup?.()
       rendered.renderer.destroy()
+    }
+  })
+
+  test('formats reset countdowns across minute, hour, and day boundaries', async () => {
+    jest.setSystemTime(new Date(2026, 9, 4, 12, 34))
+    const fixedNow = Date.now()
+    const durations = [
+      0,
+      59_999,
+      60_000,
+      3_599_999,
+      3_600_000,
+      86_399_999,
+      86_400_000,
+      6 * 24 * 60 * 60_000 + 4 * 60 * 60_000,
+    ]
+    const expected = ['0m', '0m', '1m', '59m', '1h0m', '23h59m', '1d0h', '6d4h']
+    const baseSnapshot = sidebarSnapshot(100)
+    const base = baseSnapshot.accounts[0]!
+    baseSnapshot.accounts = Array.from({ length: 4 }, (_, index) => {
+      const first = index * 2
+      return {
+        ...base,
+        label: `Reset account ${index + 1}`,
+        current: 'both',
+        gemini: {
+          ...base.gemini,
+          updatedAt: fixedNow,
+          windows: [
+            {
+              name: '5h',
+              remainingPercent: 100,
+              resetAt: fixedNow + durations[first]!,
+            },
+            {
+              name: 'weekly',
+              remainingPercent: 100,
+              resetAt: fixedNow + durations[first + 1]!,
+            },
+          ],
+        },
+        nonGemini: {
+          ...base.nonGemini,
+          updatedAt: fixedNow,
+          windows: [],
+          resetAt: undefined,
+        },
+      }
+    })
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-reset-boundaries' },
+      { sidebarQuota: baseSnapshot },
+    )
+    mounted.selectModel('session-reset-boundaries', {
+      providerID: 'google',
+      id: 'gemini-3.8-flash',
+    })
+    const rendered = await testRender(
+      () =>
+        mounted.renderSidebar!({
+          sessionID: 'session-reset-boundaries',
+        }) as never,
+      { width: 32, height: 70 },
+    )
+    try {
+      await Bun.sleep(0)
+      await rendered.flush()
+      const frame = rendered.captureCharFrame()
+      for (const value of expected) expect(frame).toContain(value)
+      expect(frame.replace(/\s/g, '')).toContain('remaining/resetin')
+      expect(frame).toContain('Cached · 10-04 12:34 · just now')
+      expect(frame).not.toContain('just now ago')
+      await saveCapture('sidebar-reset-boundaries', rendered)
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      jest.useRealTimers()
     }
   })
 
@@ -1707,7 +1890,7 @@ describe('OpenCode 2 quota sidebar', () => {
         const header = lines[headerIndex]!.slice(0, slotWidth)
         expect(header.trimEnd().endsWith('Gemini')).toBe(true)
         expect(header.indexOf('Gemini')).toBe(slotWidth - 'Gemini'.length)
-        expect(lines[headerIndex + 1]).toContain('accounts · remaining')
+        expect(lines[headerIndex + 1]).toContain('accounts · remaining / reset')
         for (const [label, status] of [
           ['Default account', 'ACTIVE Default'],
           ['Disabled', 'DISABLED Default'],
@@ -1738,13 +1921,13 @@ describe('OpenCode 2 quota sidebar', () => {
         const resetLabels = quotaRows
           .map((line) => line.slice(slotWidth - 6, slotWidth).trim())
           .filter(Boolean)
-        expect(resetLabels.some((label) => /^47h5[89]m$/.test(label))).toBe(
+        expect(resetLabels.some((label) => /^1d23h$/.test(label))).toBe(true)
+        expect(resetLabels.some((label) => /^(?:59m|1h0m)$/.test(label))).toBe(
           true,
         )
-        expect(resetLabels.some((label) => /^(?:59m|1h)$/.test(label))).toBe(
+        expect(resetLabels.some((label) => /^[34]d\d+h$/.test(label))).toBe(
           true,
         )
-        expect(resetLabels.some((label) => /^[34]d$/.test(label))).toBe(true)
         const noReset = quotaRows.find(
           (line) =>
             line.startsWith('NG   ') &&
@@ -1771,7 +1954,7 @@ describe('OpenCode 2 quota sidebar', () => {
       for (const width of [32, 27, 26, 16, 15, 10, 8]) {
         const snapshot = sidebarSnapshot(63)
         const base = snapshot.accounts[0]!
-        const updatedAt = new Date(2026, 9, 4, 12, 33).getTime()
+        const updatedAt = fixedNow - 59_999
         snapshot.accounts = [
           {
             ...base,
@@ -1845,13 +2028,15 @@ describe('OpenCode 2 quota sidebar', () => {
           expect(compact).toContain('Gm7d')
           expect(compact).toContain('NG5h')
           expect(compact).toContain('NG7d')
+          expect(compact).toContain('remaining/resetin')
           expect(compact).toContain('100%')
           expect(compact).toContain('63%')
           expect(compact).toContain('—')
           expect(compact).toContain('Quotarefreshfailed')
           expect(compact).toContain('Cached')
           expect(compact).toContain('10-0412:33')
-          expect(compact).toContain('1mago')
+          expect(compact).toContain('justnow')
+          expect(compact).not.toContain('justnowago')
           expect(compact).toContain('4d')
 
           const expectedBars = new Map([
@@ -2032,10 +2217,15 @@ describe('OpenCode 2 quota sidebar', () => {
     let resolveCache!: (value: SidebarQuotaSnapshot) => void
     const resolveEnsures: Array<(value: SidebarQuotaSnapshot) => void> = []
     const pollCallbacks: Array<() => void> = []
+    const clockCallbacks: Array<() => void> = []
+    let now = 1_800_000_000_000
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now)
     const scheduled = jest.spyOn(globalThis, 'setInterval')
     scheduled.mockImplementation(((handler: TimerHandler, delay?: number) => {
       if (delay === 15_000 && typeof handler === 'function')
         pollCallbacks.push(handler as () => void)
+      if (delay === 60_000 && typeof handler === 'function')
+        clockCallbacks.push(handler as () => void)
       return 1 as never
     }) as typeof setInterval)
     const mounted = setup(
@@ -2068,9 +2258,25 @@ describe('OpenCode 2 quota sidebar', () => {
       await Bun.sleep(0)
       expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
       expect(resolveEnsures).toHaveLength(1)
+      await rendered.flush()
+      const before = rendered.captureCharFrame()
+      expect(before).toContain('12%')
+      expect(before).toContain('1m ago')
+      expect(before).toContain('1h0m')
       pollCallbacks[0]!()
       await Bun.sleep(0)
       expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+
+      now += 60_000
+      expect(clockCallbacks).toHaveLength(1)
+      clockCallbacks[0]!()
+      await rendered.flush()
+      const after = rendered.captureCharFrame()
+      expect(after).toContain('12%')
+      expect(after).toContain('2m ago')
+      expect(after).toContain('59m')
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+      expect(resolveEnsures).toHaveLength(1)
 
       resolveEnsures[0]!(sidebarSnapshot(30, 'live'))
       await Bun.sleep(0)
@@ -2088,6 +2294,7 @@ describe('OpenCode 2 quota sidebar', () => {
       rendered.renderer.destroy()
       await mounted.cleanup?.()
       scheduled.mockRestore()
+      dateNowSpy.mockRestore()
     }
   })
 
