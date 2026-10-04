@@ -382,6 +382,18 @@ export const tui = {
         showDetails?: boolean
       }) {
         const value = () => props.cell.remainingPercent
+        const percentageText = (percentage = value()) =>
+          percentage === null ? '   —' : `${String(percentage).padStart(3)}%`
+        const resetText = (resetAt?: number) =>
+          resetAt === undefined ? undefined : relative(resetAt - now())
+        const barText = (percentage = value()) => {
+          if (percentage === null) return '──────────'
+          const filled =
+            !Number.isFinite(percentage) || percentage <= 0
+              ? 0
+              : Math.round(Math.max(0, Math.min(100, percentage)) / 10)
+          return `${'▰'.repeat(filled)}${'▱'.repeat(10 - filled)}`
+        }
         const severityColor = (percentage = value()) => {
           if (percentage === null) return theme().textMuted
           if (percentage <= 20)
@@ -389,15 +401,6 @@ export const tui = {
           if (percentage <= 50)
             return theme().warning ?? theme().accent ?? theme().text
           return theme().success ?? theme().accent ?? theme().text
-        }
-        const filledCells = (percentage = value()) => {
-          if (
-            percentage === null ||
-            !Number.isFinite(percentage) ||
-            percentage <= 0
-          )
-            return 0
-          return Math.round(Math.max(0, Math.min(100, percentage)) / 10)
         }
         const rows = () => {
           const windows = [...props.cell.windows].sort((left, right) => {
@@ -422,52 +425,127 @@ export const tui = {
           <box flexDirection='column'>
             <For each={rows()}>
               {(row) => (
-                <box flexDirection='row' width='100%'>
-                  <text
-                    width={5}
-                    flexShrink={0}
-                    fg={props.selected ? theme().accent : theme().textMuted}
-                    attributes={props.selected ? TextAttributes.BOLD : 0}
-                  >
-                    {row.label}
-                  </text>
-                  <text> </text>
-                  <text width={10} flexShrink={0} fg={severityColor(row.value)}>
-                    {row.value === null
-                      ? '──────────'
-                      : `${'▰'.repeat(filledCells(row.value))}${'▱'.repeat(10 - filledCells(row.value))}`}
-                  </text>
-                  <box flexGrow={1} />
-                  <box width={11} flexShrink={0} flexDirection='row'>
-                    <text
-                      width={4}
-                      flexShrink={0}
-                      fg={severityColor(row.value)}
-                    >
-                      {row.value === null
-                        ? '   —'
-                        : `${String(row.value).padStart(3)}%`}
-                    </text>
-                    <text> </text>
-                    <box
-                      width={6}
-                      flexShrink={0}
-                      flexDirection='row'
-                      justifyContent='flex-end'
-                    >
+                <>
+                  <Show when={props.slotWidth >= 27}>
+                    <box flexDirection='row' width='100%'>
+                      <text
+                        width={5}
+                        flexShrink={0}
+                        fg={props.selected ? theme().accent : theme().textMuted}
+                        attributes={props.selected ? TextAttributes.BOLD : 0}
+                      >
+                        {row.label}
+                      </text>
+                      <text> </text>
+                      <text
+                        width={10}
+                        flexShrink={0}
+                        fg={severityColor(row.value)}
+                      >
+                        {barText(row.value)}
+                      </text>
+                      <box flexGrow={1} />
+                      <box width={11} flexShrink={0} flexDirection='row'>
+                        <text
+                          width={4}
+                          flexShrink={0}
+                          fg={severityColor(row.value)}
+                        >
+                          {percentageText(row.value)}
+                        </text>
+                        <text> </text>
+                        <box
+                          width={6}
+                          flexShrink={0}
+                          flexDirection='row'
+                          justifyContent='flex-end'
+                        >
+                          <Show when={row.resetAt !== undefined}>
+                            <text fg={theme().textMuted}>
+                              {resetText(row.resetAt)}
+                            </text>
+                          </Show>
+                        </box>
+                      </box>
+                    </box>
+                  </Show>
+                  <Show when={props.slotWidth >= 16 && props.slotWidth < 27}>
+                    <box flexDirection='row' width='100%'>
+                      <text
+                        width={5}
+                        flexShrink={0}
+                        fg={props.selected ? theme().accent : theme().textMuted}
+                        attributes={props.selected ? TextAttributes.BOLD : 0}
+                      >
+                        {row.label}
+                      </text>
+                      <text> </text>
+                      <text fg={severityColor(row.value)}>
+                        {barText(row.value)}
+                      </text>
+                    </box>
+                    <box flexDirection='row' width='100%'>
+                      <text fg={severityColor(row.value)}>
+                        {percentageText(row.value)}
+                      </text>
                       <Show when={row.resetAt !== undefined}>
                         <text fg={theme().textMuted}>
-                          {relative(row.resetAt! - now())}
+                          {' '}
+                          {resetText(row.resetAt)}
                         </text>
                       </Show>
                     </box>
-                  </box>
-                </box>
+                  </Show>
+                  <Show when={props.slotWidth < 16}>
+                    <text
+                      fg={props.selected ? theme().accent : theme().textMuted}
+                      attributes={props.selected ? TextAttributes.BOLD : 0}
+                    >
+                      {wrapText(row.label, props.slotWidth)}
+                    </text>
+                    <For
+                      each={wrapText(barText(row.value), props.slotWidth).split(
+                        '\n',
+                      )}
+                    >
+                      {(part) => (
+                        <text fg={severityColor(row.value)}>{part}</text>
+                      )}
+                    </For>
+                    <Show when={props.slotWidth >= 11}>
+                      <text fg={severityColor(row.value)}>
+                        {percentageText(row.value)}
+                        {row.resetAt !== undefined
+                          ? ` ${resetText(row.resetAt)}`
+                          : ''}
+                      </text>
+                    </Show>
+                    <Show when={props.slotWidth < 11}>
+                      <text fg={severityColor(row.value)}>
+                        {percentageText(row.value)}
+                      </text>
+                      <Show when={row.resetAt !== undefined}>
+                        <text fg={theme().textMuted}>
+                          {wrapText(
+                            resetText(row.resetAt) ?? '',
+                            props.slotWidth,
+                          )}
+                        </text>
+                      </Show>
+                    </Show>
+                  </Show>
+                </>
               )}
             </For>
             <Show when={props.showDetails !== false}>
               <For each={quotaDetails(props.cell, props.slotWidth)}>
-                {(line) => <text fg={theme().textMuted}>{line}</text>}
+                {(line) => (
+                  <text fg={theme().textMuted}>
+                    {props.slotWidth < 27
+                      ? wrapText(line, props.slotWidth)
+                      : line}
+                  </text>
+                )}
               </For>
             </Show>
           </box>
@@ -648,6 +726,8 @@ export const tui = {
             accountState(account.state).length +
             (isDefaultForGroup(account, selectedGroup) ? 8 : 0)
           const maxWidth = Math.max(1, sidebarWidth() - 1 - statusWidth)
+          if (sidebarWidth() < 27)
+            return wrapText(account.label, sidebarWidth())
           return account.label.length > maxWidth
             ? `${account.label.slice(0, maxWidth - 1)}…`
             : account.label
@@ -667,20 +747,38 @@ export const tui = {
                 width='100%'
                 paddingY={1}
               >
-                <box flexDirection='row' width='100%'>
+                <box
+                  flexDirection={sidebarWidth() < 27 ? 'column' : 'row'}
+                  width='100%'
+                >
                   <text fg={theme().accent} attributes={TextAttributes.BOLD}>
-                    Antigravity
+                    {sidebarWidth() < 12
+                      ? wrapText('Antigravity', sidebarWidth())
+                      : 'Antigravity'}
                   </text>
-                  <box flexGrow={1} />
+                  <Show when={sidebarWidth() >= 27}>
+                    <box flexGrow={1} />
+                  </Show>
                   <text fg={theme().accent} attributes={TextAttributes.BOLD}>
-                    {selectedGroup() === 'gemini' ? 'Gemini' : 'Claude/other'}
+                    {sidebarWidth() < 12
+                      ? wrapText(
+                          selectedGroup() === 'gemini'
+                            ? 'Gemini'
+                            : 'Claude/other',
+                          sidebarWidth(),
+                        )
+                      : selectedGroup() === 'gemini'
+                        ? 'Gemini'
+                        : 'Claude/other'}
                   </text>
                 </box>
                 <text fg={theme().textMuted}>
-                  {data()
-                    ? `${data()!.accounts.length} ${data()!.accounts.length === 1 ? 'account' : 'accounts'}`
-                    : 'Loading quota…'}
-                  {' · remaining'}
+                  {wrapText(
+                    data()
+                      ? `${data()!.accounts.length} ${data()!.accounts.length === 1 ? 'account' : 'accounts'} · remaining`
+                      : 'Loading quota…',
+                    sidebarWidth(),
+                  )}
                 </text>
                 <Show
                   when={data() && data()!.accounts.length > 0}
@@ -700,7 +798,9 @@ export const tui = {
                       return (
                         <box flexDirection='column' marginTop={1}>
                           <box
-                            flexDirection='row'
+                            flexDirection={
+                              sidebarWidth() < 27 ? 'column' : 'row'
+                            }
                             width='100%'
                             justifyContent='space-between'
                           >
@@ -711,7 +811,11 @@ export const tui = {
                             >
                               {accountLabel(account, selectedGroup())}
                             </text>
-                            <box flexDirection='row'>
+                            <box
+                              flexDirection={
+                                sidebarWidth() < 19 ? 'column' : 'row'
+                              }
+                            >
                               <text
                                 fg={
                                   account.state === 'active'
@@ -719,7 +823,12 @@ export const tui = {
                                     : theme().warning
                                 }
                               >
-                                {accountState(account.state)}
+                                {sidebarWidth() < 16
+                                  ? wrapText(
+                                      accountState(account.state),
+                                      sidebarWidth(),
+                                    )
+                                  : accountState(account.state)}
                               </text>
                               <Show
                                 when={isDefaultForGroup(
@@ -727,7 +836,11 @@ export const tui = {
                                   selectedGroup(),
                                 )}
                               >
-                                <text fg={theme().textMuted}> Default</text>
+                                <text fg={theme().textMuted}>
+                                  {sidebarWidth() < 16
+                                    ? wrapText('Default', sidebarWidth())
+                                    : ' Default'}
+                                </text>
                               </Show>
                             </box>
                           </box>
@@ -753,7 +866,11 @@ export const tui = {
                               )}
                             >
                               {(line) => (
-                                <text fg={theme().textMuted}>{line}</text>
+                                <text fg={theme().textMuted}>
+                                  {sidebarWidth() < 27
+                                    ? wrapText(line, sidebarWidth())
+                                    : line}
+                                </text>
                               )}
                             </For>
                           </Show>
@@ -763,10 +880,22 @@ export const tui = {
                   </For>
                 </Show>
                 <Show when={notice()}>
-                  {(value) => <text fg={theme().warning}>{value()}</text>}
+                  {(value) => (
+                    <text fg={theme().warning}>
+                      {sidebarWidth() < 27
+                        ? wrapText(value(), sidebarWidth())
+                        : value()}
+                    </text>
+                  )}
                 </Show>
                 <Show when={sessionNotice()}>
-                  {(value) => <text fg={theme().warning}>{value()}</text>}
+                  {(value) => (
+                    <text fg={theme().warning}>
+                      {sidebarWidth() < 27
+                        ? wrapText(value(), sidebarWidth())
+                        : value()}
+                    </text>
+                  )}
                 </Show>
               </box>
             )}
@@ -934,6 +1063,31 @@ export const tui = {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function wrapText(value: string, width: number): string {
+  const limit = Math.max(1, Math.floor(width))
+  const lines: string[] = []
+  let line = ''
+  for (const input of value.split(/\s+/).filter(Boolean)) {
+    let word = input
+    while (Array.from(word).length > limit) {
+      if (line) {
+        lines.push(line)
+        line = ''
+      }
+      const columns = Array.from(word)
+      lines.push(columns.slice(0, limit).join(''))
+      word = columns.slice(limit).join('')
+    }
+    if (line && Array.from(line).length + 1 + Array.from(word).length > limit) {
+      lines.push(line)
+      line = ''
+    }
+    line = line ? `${line} ${word}` : word
+  }
+  if (line) lines.push(line)
+  return lines.join('\n')
 }
 
 function relative(ms: number): string {

@@ -1764,6 +1764,142 @@ describe('OpenCode 2 quota sidebar', () => {
     }
   })
 
+  test('wraps quota rows and sidebar fields at narrow measured widths', async () => {
+    jest.setSystemTime(new Date(2026, 9, 4, 12, 34))
+    const fixedNow = Date.now()
+    try {
+      for (const width of [32, 27, 26, 16, 15, 10, 8]) {
+        const snapshot = sidebarSnapshot(63)
+        const base = snapshot.accounts[0]!
+        const updatedAt = new Date(2026, 9, 4, 12, 33).getTime()
+        snapshot.accounts = [
+          {
+            ...base,
+            label: 'Account Long',
+            state: 'verification-required',
+            current: 'both',
+            gemini: {
+              ...base.gemini,
+              updatedAt,
+              windows: [
+                {
+                  name: '5h',
+                  remainingPercent: 100,
+                  resetAt: fixedNow + 60_000,
+                },
+                {
+                  name: 'weekly',
+                  remainingPercent: null,
+                  resetAt: fixedNow + 4 * 24 * 60 * 60_000,
+                },
+              ],
+            },
+            nonGemini: {
+              ...base.nonGemini,
+              updatedAt,
+              windows: [
+                {
+                  name: '5h',
+                  remainingPercent: 63,
+                  resetAt: fixedNow + 60_000,
+                },
+                {
+                  name: 'weekly',
+                  remainingPercent: null,
+                  resetAt: fixedNow + 4 * 24 * 60 * 60_000,
+                },
+              ],
+            },
+          },
+        ]
+        const sessionID = `sidebar-wrap-${width}`
+        const mounted = setup(
+          { type: 'session', sessionID },
+          {
+            sidebarQuota: async ({ mode }) => {
+              if (mode === 'cache') return snapshot
+              throw new Error('offline')
+            },
+          },
+        )
+        mounted.selectModel(sessionID, {
+          providerID: 'google',
+          id: 'claude-sonnet-4-6-thinking',
+        })
+        const rendered = await testRender(
+          () => mounted.renderSidebar!({ sessionID }) as never,
+          { width, height: 90 },
+        )
+        try {
+          await Bun.sleep(0)
+          await Bun.sleep(0)
+          await rendered.flush()
+          const frame = rendered.captureCharFrame()
+          const compact = frame.replace(/\s/g, '')
+          const lines = frame.split('\n')
+          expect(lines.every((line) => line.length <= width)).toBe(true)
+          expect(compact).toContain('AntigravityClaude/other')
+          expect(compact).toContain('AccountLong')
+          expect(compact).toContain('VERIFYDefault')
+          expect(compact).toContain('Gm5h')
+          expect(compact).toContain('Gm7d')
+          expect(compact).toContain('NG5h')
+          expect(compact).toContain('NG7d')
+          expect(compact).toContain('100%')
+          expect(compact).toContain('63%')
+          expect(compact).toContain('—')
+          expect(compact).toContain('Quotarefreshfailed')
+          expect(compact).toContain('Cached')
+          expect(compact).toContain('10-0412:33')
+          expect(compact).toContain('1mago')
+          expect(compact).toContain('4d')
+
+          const expectedBars = new Map([
+            ['Gm 5h', '▰'.repeat(10)],
+            ['Gm 7d', '─'.repeat(10)],
+            ['NG 5h', `${'▰'.repeat(6)}${'▱'.repeat(4)}`],
+            ['NG 7d', '─'.repeat(10)],
+          ])
+          const rowLabels = [...expectedBars.keys()]
+          for (const [index, [label, expected]] of [
+            ...expectedBars,
+          ].entries()) {
+            const start = lines.findIndex((line) => line.includes(label))
+            expect(start).toBeGreaterThanOrEqual(0)
+            const nextStart = rowLabels
+              .slice(index + 1)
+              .map((nextLabel) =>
+                lines.findIndex((line) => line.includes(nextLabel)),
+              )
+              .find((lineIndex) => lineIndex > start)
+            const segment = lines.slice(start, nextStart ?? lines.length)
+            const cells = segment.join('').match(/[▰▱─]/g)?.join('') ?? ''
+            expect(cells).toBe(expected)
+            const rowLines = segment.filter((line) => line.trim().length > 0)
+            const percentLine = rowLines.find((line) =>
+              line.includes(
+                label === 'NG 5h' ? ' 63%' : label === 'Gm 5h' ? '100%' : '—',
+              ),
+            )
+            expect(percentLine).toBeDefined()
+            const resetLine = rowLines.find((line) =>
+              line.includes(label.endsWith('5h') ? '1m' : '4d'),
+            )
+            expect(resetLine).toBeDefined()
+            if (width < 11) expect(percentLine).not.toBe(resetLine)
+            else expect(percentLine).toBe(resetLine)
+          }
+          await saveCapture(`sidebar-wrap-${width}`, rendered)
+        } finally {
+          await mounted.cleanup?.()
+          rendered.renderer.destroy()
+        }
+      }
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
   test('keeps cached values on transport failure and ignores hidden late results', async () => {
     let resolveEnsure!: (value: SidebarQuotaSnapshot) => void
     const mounted = setup(
