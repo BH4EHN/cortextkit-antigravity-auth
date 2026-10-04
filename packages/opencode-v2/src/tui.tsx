@@ -1,6 +1,7 @@
 import type { Definition } from '@opencode-ai/plugin/tui/plugin'
 import { type BoxRenderable, TextAttributes } from '@opentui/core'
 import {
+  batch,
   createEffect,
   createRoot,
   createSignal,
@@ -29,6 +30,8 @@ export const tui = {
       const [view, setView] = createSignal<View>('account')
       const [messages, setMessages] = createSignal<string[]>([])
       const [snapshot, setSnapshot] = createSignal<AntigravityPanelSnapshot>()
+      const [snapshotReceivedAt, setSnapshotReceivedAt] = createSignal<number>()
+      const [now, setNow] = createSignal(Date.now())
       const [busy, setBusy] = createSignal(false)
       const [operation, setOperation] = createSignal<{
         operationId: string
@@ -39,6 +42,16 @@ export const tui = {
       const sessionData = ctx.data
       let sequence = 0
       let timer: ReturnType<typeof setInterval> | undefined
+      const clock = setInterval(() => setNow(Date.now()), 60_000)
+
+      function acceptSnapshot(value?: AntigravityPanelSnapshot) {
+        const receivedAt = value ? Date.now() : undefined
+        batch(() => {
+          setNow(receivedAt ?? Date.now())
+          setSnapshot(value)
+          setSnapshotReceivedAt(receivedAt)
+        })
+      }
 
       function resolveLocation(sessionID?: string) {
         const directory =
@@ -67,7 +80,7 @@ export const tui = {
           )
           if (operation() !== current || sequence !== current.sequence) return
           if (view() === 'account') {
-            if (result.snapshot) setSnapshot(result.snapshot)
+            if (result.snapshot) acceptSnapshot(result.snapshot)
             setMessages(result.notices ?? result.messages)
           }
           if (result.state !== 'pending') {
@@ -109,7 +122,7 @@ export const tui = {
         setView(name)
         setBusy(true)
         setMessages([])
-        setSnapshot(undefined)
+        acceptSnapshot(undefined)
         try {
           const result = await rpc.run(
             { name, args },
@@ -117,7 +130,7 @@ export const tui = {
           )
           if (current !== sequence) return
           setMessages(result.notices ?? result.messages)
-          setSnapshot(result.snapshot)
+          acceptSnapshot(result.snapshot)
           if (result.operationId) {
             const handle = {
               operationId: result.operationId,
@@ -214,7 +227,7 @@ export const tui = {
                     ? 'no data'
                     : `${window.remainingPercent}%`}
                   {window.resetAt !== undefined
-                    ? ` · resets ${relative(window.resetAt - Date.now())}`
+                    ? ` · resets ${relative(window.resetAt - now())}`
                     : ''}
                 </text>
               )}
@@ -222,7 +235,7 @@ export const tui = {
             {props.cell.windows.length === 0 &&
             props.cell.resetAt !== undefined ? (
               <text fg={theme().textMuted}>
-                Resets {relative(props.cell.resetAt - Date.now())}
+                Resets {relative(props.cell.resetAt - now())}
               </text>
             ) : null}
           </box>
@@ -273,7 +286,7 @@ export const tui = {
             <text fg={theme().textMuted}>
               Quota cache:{' '}
               {props.account.cacheUpdatedAt !== undefined
-                ? `${relative(Date.now() - props.account.cacheUpdatedAt)} ago`
+                ? `${relative(now() - props.account.cacheUpdatedAt)} ago`
                 : 'not available'}
             </text>
           </box>
@@ -282,8 +295,13 @@ export const tui = {
 
       function StatusView(props: {
         data: Extract<AntigravityPanelSnapshot, { kind: 'status' }>
+        receivedAt?: number
       }) {
-        const cacheAge = () => props.data.quotaCache.oldestAgeMs
+        const cacheAge = () => {
+          const age = props.data.quotaCache.oldestAgeMs
+          if (age === null) return null
+          return age + Math.max(0, now() - (props.receivedAt ?? now()))
+        }
         return (
           <box flexDirection='column'>
             <text fg={theme().accent}>Pool</text>
@@ -345,7 +363,7 @@ export const tui = {
           : `${source} · update unknown`
         const suffix = [
           validTimestamp
-            ? `${relative(Date.now() - cell.updatedAt!)} ago`
+            ? `${relative(now() - cell.updatedAt!)} ago`
             : undefined,
           state,
         ].filter((part): part is string => part !== undefined)
@@ -439,7 +457,7 @@ export const tui = {
                     >
                       <Show when={row.resetAt !== undefined}>
                         <text fg={theme().textMuted}>
-                          {relative(row.resetAt! - Date.now())}
+                          {relative(row.resetAt! - now())}
                         </text>
                       </Show>
                     </box>
@@ -517,7 +535,10 @@ export const tui = {
               { location: { directory } },
             )
             if (current !== generation || !active) return
-            setData(result)
+            batch(() => {
+              setNow(Date.now())
+              setData(result)
+            })
             setNotice(result.notices[0])
           } catch {
             if (current !== generation || !active) return
@@ -786,6 +807,7 @@ export const tui = {
                           { kind: 'status' }
                         >
                       }
+                      receivedAt={snapshotReceivedAt()}
                     />
                   ) : (
                     <For each={accounts()}>
@@ -886,6 +908,7 @@ export const tui = {
         sequence++
         setOperation(undefined)
         stopPolling()
+        clearInterval(clock)
         offCommands()
         offPanel()
         offSidebar()

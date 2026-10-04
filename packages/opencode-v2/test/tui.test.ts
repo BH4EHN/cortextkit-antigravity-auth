@@ -551,9 +551,16 @@ describe('OpenCode 2 TUI slash commands', () => {
         .find((command) => command.slash?.name === 'antigravity-account')!
         .run('login')
       const timer = setIntervalSpy.mock.results.at(-1)?.value
+      const clockIndex = setIntervalSpy.mock.calls.findIndex(
+        ([, delay]) => delay === 60_000,
+      )
+      expect(clockIndex).toBeGreaterThanOrEqual(0)
+      const clockTimer = setIntervalSpy.mock.results[clockIndex]?.value
       expect(timer).toBeDefined()
+      expect(clockTimer).toBeDefined()
       mounted.cleanup?.()
       expect(clearIntervalSpy).toHaveBeenCalledWith(timer)
+      expect(clearIntervalSpy).toHaveBeenCalledWith(clockTimer)
       resolveOperation({ state: 'failed', messages: ['Late failure'] })
       await Bun.sleep(0)
       expect(
@@ -671,6 +678,176 @@ describe('OpenCode 2 TUI slash commands', () => {
       await mounted.cleanup?.()
       narrow.renderer.destroy()
       wide.renderer.destroy()
+    }
+  })
+
+  test('status cache age advances from the accepted snapshot without another RPC', async () => {
+    let now = 1_800_000_000_000
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now)
+    const intervalSpy = jest.spyOn(globalThis, 'setInterval')
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: {
+          messages: [],
+          snapshot: {
+            kind: 'status',
+            pool: {
+              total: 1,
+              enabled: 1,
+              disabled: 0,
+              ineligible: 0,
+              verificationRequired: 0,
+            },
+            current: { claude: 'Account 1', gemini: 'Account 1' },
+            quotaCache: { oldestAgeMs: 2 * 60_000 },
+            paths: { accountsFile: '/accounts.json', logFile: '/log.txt' },
+          },
+        },
+      },
+    )
+    const rendered = await testRender(() => mounted.renderPage!() as never, {
+      width: 80,
+      height: 30,
+    })
+    try {
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-status')!
+        .run()
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain(
+        'Oldest enabled account cache: 2m ago',
+      )
+
+      now += 60_000
+      const clockCall = intervalSpy.mock.calls.find(
+        ([, delay]) => delay === 60_000,
+      )
+      expect(clockCall).toBeDefined()
+      ;(clockCall![0] as () => void)()
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain(
+        'Oldest enabled account cache: 3m ago',
+      )
+      expect(
+        mounted.rpcLocations.filter(({ method }) => method === 'run'),
+      ).toHaveLength(1)
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      intervalSpy.mockRestore()
+      dateNowSpy.mockRestore()
+    }
+  })
+
+  test('unknown status cache age stays unknown as the shared clock advances', async () => {
+    let now = 1_800_000_000_000
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now)
+    const intervalSpy = jest.spyOn(globalThis, 'setInterval')
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: {
+          messages: [],
+          snapshot: {
+            kind: 'status',
+            pool: {
+              total: 0,
+              enabled: 0,
+              disabled: 0,
+              ineligible: 0,
+              verificationRequired: 0,
+            },
+            current: { claude: null, gemini: null },
+            quotaCache: { oldestAgeMs: null },
+            paths: { accountsFile: '/accounts.json', logFile: '/log.txt' },
+          },
+        },
+      },
+    )
+    const rendered = await testRender(() => mounted.renderPage!() as never, {
+      width: 80,
+      height: 30,
+    })
+    try {
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-status')!
+        .run()
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Never refreshed')
+
+      now += 60_000
+      const clockCall = intervalSpy.mock.calls.find(
+        ([, delay]) => delay === 60_000,
+      )
+      expect(clockCall).toBeDefined()
+      ;(clockCall![0] as () => void)()
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain('Never refreshed')
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      intervalSpy.mockRestore()
+      dateNowSpy.mockRestore()
+    }
+  })
+
+  test('zero status cache age advances as a known value', async () => {
+    let now = 1_800_000_000_000
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now)
+    const intervalSpy = jest.spyOn(globalThis, 'setInterval')
+    const mounted = setup(
+      { type: 'home' },
+      {
+        run: {
+          messages: [],
+          snapshot: {
+            kind: 'status',
+            pool: {
+              total: 0,
+              enabled: 0,
+              disabled: 0,
+              ineligible: 0,
+              verificationRequired: 0,
+            },
+            current: { claude: null, gemini: null },
+            quotaCache: { oldestAgeMs: 0 },
+            paths: { accountsFile: '/accounts.json', logFile: '/log.txt' },
+          },
+        },
+      },
+    )
+    const rendered = await testRender(() => mounted.renderPage!() as never, {
+      width: 80,
+      height: 30,
+    })
+    try {
+      await mounted.commands
+        .find((command) => command.slash?.name === 'antigravity-status')!
+        .run()
+      await Bun.sleep(0)
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain(
+        'Oldest enabled account cache: 0m ago',
+      )
+
+      now += 60_000
+      const clockCall = intervalSpy.mock.calls.find(
+        ([, delay]) => delay === 60_000,
+      )
+      expect(clockCall).toBeDefined()
+      ;(clockCall![0] as () => void)()
+      await rendered.flush()
+      expect(rendered.captureCharFrame()).toContain(
+        'Oldest enabled account cache: 1m ago',
+      )
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      intervalSpy.mockRestore()
+      dateNowSpy.mockRestore()
     }
   })
 
@@ -1575,6 +1752,60 @@ describe('OpenCode 2 quota sidebar', () => {
     } finally {
       await mounted.cleanup?.()
       rendered.renderer.destroy()
+    }
+  })
+
+  test('shared clock advances cached sidebar age and reset countdown after refresh failure', async () => {
+    let now = 1_800_000_000_000
+    const dateNowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now)
+    const intervalSpy = jest.spyOn(globalThis, 'setInterval')
+    const mounted = setup(
+      { type: 'session', sessionID: 'session-clock' },
+      {
+        sidebarQuota: async ({ mode }) => {
+          if (mode === 'cache') return sidebarSnapshot(41)
+          throw new Error('unavailable')
+        },
+      },
+    )
+    mounted.selectModel('session-clock', {
+      providerID: 'google',
+      id: 'gemini-3.6-flash',
+    })
+    const rendered = await testRender(
+      () => mounted.renderSidebar!({ sessionID: 'session-clock' }) as never,
+      { width: 60, height: 36 },
+    )
+    try {
+      await Bun.sleep(0)
+      await Bun.sleep(0)
+      await rendered.flush()
+      const before = rendered.captureCharFrame()
+      expect(before).toContain('41%')
+      expect(before).toContain('Cached ·')
+      expect(before).toContain('1m ago')
+      expect(before).toContain('1h')
+      expect(before).toContain('Quota refresh failed')
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+
+      now += 60_000
+      const clockCall = intervalSpy.mock.calls.find(
+        ([, delay]) => delay === 60_000,
+      )
+      expect(clockCall).toBeDefined()
+      ;(clockCall![0] as () => void)()
+      await rendered.flush()
+      const after = rendered.captureCharFrame()
+      expect(after).toContain('41%')
+      expect(after).toContain('2m ago')
+      expect(after).toContain('59m')
+      expect(after).toContain('Quota refresh failed')
+      expect(mounted.sidebarCalls).toEqual(['cache', 'ensure'])
+    } finally {
+      await mounted.cleanup?.()
+      rendered.renderer.destroy()
+      intervalSpy.mockRestore()
+      dateNowSpy.mockRestore()
     }
   })
 
