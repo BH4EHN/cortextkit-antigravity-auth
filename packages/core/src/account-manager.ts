@@ -349,10 +349,14 @@ export class AccountManager {
   private savePending = false
   private saveTimeout: ReturnType<typeof setTimeout> | null = null
   private saveInFlight: Promise<void> | null = null
+  private directSaves = new Set<Promise<unknown>>()
+  private saveFailure: unknown = null
   private disposed = false
+  private persistenceStopped = false
   private savePromiseResolvers: Array<{
     resolve: () => void
     reject: (err: unknown) => void
+    strict: boolean
   }> = []
 
   private sessionStartTime: number
@@ -1726,7 +1730,18 @@ export class AccountManager {
   }
 
   async saveToDisk(): Promise<void> {
-    await this.store.saveMerged(this.storagePath, this.buildStorageSnapshot())
+    if (this.persistenceStopped)
+      throw new Error('Account manager persistence has stopped')
+    const save = this.store.saveMerged(
+      this.storagePath,
+      this.buildStorageSnapshot(),
+    )
+    this.directSaves.add(save)
+    try {
+      await save
+    } finally {
+      this.directSaves.delete(save)
+    }
   }
 
   /**
@@ -1735,8 +1750,18 @@ export class AccountManager {
    * mergeAccountStorage re-reading it from disk.
    */
   async saveToDiskReplace(): Promise<void> {
+    if (this.persistenceStopped)
+      throw new Error('Account manager persistence has stopped')
     const snapshot = this.buildStorageSnapshot()
-    await this.store.mutate(this.storagePath, () => snapshot)
+    const save = this.store
+      .mutate(this.storagePath, () => snapshot)
+      .then(() => {})
+    this.directSaves.add(save)
+    try {
+      await save
+    } finally {
+      this.directSaves.delete(save)
+    }
   }
 
   requestSaveToDisk(): void {
@@ -1751,15 +1776,54 @@ export class AccountManager {
     }, 1000)
   }
 
-  async flushSaveToDisk(): Promise<void> {
+  async flushSaveToDisk(options: { strict?: boolean } = {}): Promise<void> {
+    if (this.persistenceStopped) {
+      throw new Error('Account manager persistence has stopped')
+    }
     if (!this.savePending) {
       await this.saveInFlight
+      if (this.saveFailure && options.strict) throw this.saveFailure
       return
     }
     return new Promise<void>((resolve, reject) => {
-      this.savePromiseResolvers.push({ resolve, reject })
+      this.savePromiseResolvers.push({
+        resolve,
+        reject,
+        strict: options.strict === true,
+      })
     })
   }
+
+  /**
+   * Retire a manager before a lock-held pool mutation. A stale manager must
+   * never merge a deferred snapshot back over the newly mutated pool.
+   * The caller should flush intended state first, then await this method
+   * before starting the mutation.
+   */
+  async stopSaving(): Promise<void> {
+    if (this.persistenceStopped) {
+      await this.saveInFlight
+      await Promise.all(
+        [...this.directSaves].map((save) => save.catch(() => {})),
+      )
+      return
+    }
+    this.persistenceStopped = true
+    this.disposed = true
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout)
+      this.saveTimeout = null
+    }
+    this.savePending = false
+    const resolvers = this.savePromiseResolvers
+    this.savePromiseResolvers = []
+    for (const { reject } of resolvers) {
+      reject(new Error('Account manager persistence has stopped'))
+    }
+    await this.saveInFlight
+    await Promise.all([...this.directSaves].map((save) => save.catch(() => {})))
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
@@ -1782,10 +1846,12 @@ export class AccountManager {
 
     try {
       await this.saveToDisk()
+      this.saveFailure = null
       for (const { resolve } of resolvers) {
         resolve()
       }
     } catch (error) {
+      this.saveFailure = error
       if (isStorageLockContention(error)) {
         this.onDiagnostic?.(
           'Skipped account-state persist due to storage lock contention',
@@ -1793,8 +1859,9 @@ export class AccountManager {
             error: String(error),
           },
         )
-        for (const { resolve } of resolvers) {
-          resolve()
+        for (const waiter of resolvers) {
+          if (waiter.strict) waiter.reject(error)
+          else waiter.resolve()
         }
         return
       }

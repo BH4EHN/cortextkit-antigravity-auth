@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'bun:test'
+import { describe, expect, it, jest } from 'bun:test'
 import { AccountManager } from './account-manager.ts'
 import type { AccountStorageStore } from './account-storage.ts'
 import type { AccountStorageV4 } from './account-types.ts'
@@ -438,6 +438,170 @@ describe('core AccountManager', () => {
     manager.requestSaveToDisk()
     await manager.dispose()
     expect(memory.mergedSaves()).toBe(1)
+  })
+
+  it('stops stale deferred saves before an external pool mutation', async () => {
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: memory.store,
+    })
+    manager.requestSaveToDisk()
+    const pendingFlush = manager.flushSaveToDisk().then(
+      () => 'resolved',
+      (error: unknown) => String(error),
+    )
+
+    await manager.stopSaving()
+    expect(await pendingFlush).toContain('persistence has stopped')
+    manager.requestSaveToDisk()
+    await expect(manager.flushSaveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    await manager.dispose()
+    expect(memory.mergedSaves()).toBe(0)
+  })
+
+  it('waits for an in-flight save before stopping persistence', async () => {
+    jest.useFakeTimers()
+    try {
+      let saveCalls = 0
+      let releaseSave!: () => void
+      let markSaveStarted!: () => void
+      const saveStarted = new Promise<void>((resolve) => {
+        markSaveStarted = resolve
+      })
+      const store: AccountStorageStore = {
+        load: async () => stored,
+        saveMerged: async (_path, next) => {
+          saveCalls++
+          markSaveStarted()
+          await new Promise<void>((resolve) => {
+            releaseSave = resolve
+          })
+          return next
+        },
+        mutate: async (_path, fn) => (await fn(stored)) ?? stored,
+        clear: async () => {},
+      }
+      const manager = new AccountManager(undefined, stored, { store })
+      manager.requestSaveToDisk()
+      await jest.advanceTimersByTime(1000)
+      await saveStarted
+
+      let stopped = false
+      const stopping = manager.stopSaving().then(() => {
+        stopped = true
+      })
+      await Promise.resolve()
+      expect(stopped).toBe(false)
+
+      releaseSave()
+      await stopping
+      expect(stopped).toBe(true)
+      expect(saveCalls).toBe(1)
+
+      manager.requestSaveToDisk()
+      await expect(manager.flushSaveToDisk()).rejects.toThrow(
+        'persistence has stopped',
+      )
+      await jest.advanceTimersByTime(1000)
+      expect(saveCalls).toBe(1)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('waits for direct saves and rejects both direct save APIs after retirement', async () => {
+    let release!: () => void
+    let started!: () => void
+    const saveStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    let calls = 0
+    const memory = createStore(stored)
+    const store: AccountStorageStore = {
+      ...memory.store,
+      saveMerged: async (_path, snapshot) => {
+        calls++
+        started()
+        await new Promise<void>((resolve) => {
+          release = resolve
+        })
+        return snapshot
+      },
+    }
+    const manager = new AccountManager(undefined, stored, { store })
+    const saving = manager.saveToDisk()
+    await saveStarted
+    let stopped = false
+    const firstStop = manager.stopSaving().then(() => {
+      stopped = true
+    })
+    const secondStop = manager.stopSaving()
+    await Promise.resolve()
+    expect(stopped).toBe(false)
+    await expect(manager.saveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    await expect(manager.saveToDiskReplace()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    release()
+    await Promise.all([saving, firstStop, secondStop])
+    expect(calls).toBe(1)
+    expect(memory.mutations()).toBe(0)
+  })
+
+  it('preserves non-fatal lock contention for ordinary flushes and rejects strict transition flushes', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          saveMerged: async () => {
+            throw new Error('ELOCKED')
+          },
+        },
+      })
+      manager.requestSaveToDisk()
+      const ordinary = manager.flushSaveToDisk()
+      const strict = manager.flushSaveToDisk({ strict: true })
+      await jest.advanceTimersByTime(1000)
+      await expect(ordinary).resolves.toBeUndefined()
+      await expect(strict).rejects.toThrow('ELOCKED')
+      await expect(manager.flushSaveToDisk()).resolves.toBeUndefined()
+      await expect(manager.flushSaveToDisk({ strict: true })).rejects.toThrow(
+        'ELOCKED',
+      )
+      await manager.stopSaving()
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('inspects retained non-contention failures only for strict flushes', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          saveMerged: async () => {
+            throw new Error('disk full')
+          },
+        },
+      })
+      manager.requestSaveToDisk()
+      await jest.advanceTimersByTime(1000)
+      await expect(manager.flushSaveToDisk()).resolves.toBeUndefined()
+      await expect(manager.flushSaveToDisk({ strict: true })).rejects.toThrow(
+        'disk full',
+      )
+      await manager.stopSaving()
+    } finally {
+      jest.useRealTimers()
+    }
   })
 })
 
