@@ -1117,6 +1117,91 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
     }
   })
 
+  test('continues to B after a retryable pool retirement fence fails', async () => {
+    seedPool([
+      {
+        email: 'a@example.test',
+        refreshToken: 'old-a',
+        addedAt: 1,
+        lastUsed: 1,
+        enabled: true,
+      },
+      {
+        email: 'b@example.test',
+        refreshToken: 'token-b',
+        addedAt: 2,
+        lastUsed: 2,
+        enabled: true,
+      },
+    ])
+    const saveStarted = deferred<void>()
+    const releaseSave = deferred<void>()
+    const sent: string[] = []
+    let saveCalls = 0
+    let mutations = 0
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'new-a',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: 'project',
+      }),
+      mutateAccountStorage: async (file, mutator) => {
+        mutations++
+        return mutateAccountStorage(file, mutator)
+      },
+      refreshAntigravityToken: async (refresh) => ({
+        refresh,
+        access: refresh,
+        expires: Date.now() + 600_000,
+      }),
+      send: async ({ auth }) => {
+        sent.push(auth.access ?? '')
+        if (sent.length === 1) {
+          return new Response(
+            JSON.stringify({
+              error: { status: 'ACCOUNT_INELIGIBLE', message: 'blocked' },
+            }),
+            { status: 403 },
+          )
+        }
+        return successResponse()
+      },
+    })
+    const save = spyOn(
+      defaultAccountStorageStore,
+      'saveMerged',
+    ).mockImplementation(async () => {
+      saveCalls++
+      saveStarted.resolve()
+      await releaseSave.promise
+      throw new Error('retryable save failure')
+    })
+    try {
+      const pendingRequest = titleRequest(captured.hook)
+      await saveStarted.promise
+      const oauthCallback = (await captured.oauth.authorize()).callback
+      releaseSave.reject(new Error('retryable save failure'))
+      await expect(oauthCallback).rejects.toThrow('persistence retryable')
+      expect((await pendingRequest).ok).toBe(true)
+      expect(sent).toEqual(['old-a', 'token-b'])
+      expect(saveCalls).toBe(1)
+      expect(mutations).toBe(0)
+    } finally {
+      releaseSave.resolve()
+      save.mockRestore()
+      await captured.cleanup()
+    }
+  })
+
   test('does not dispatch B after cancellation while persisting a 403 account flag', async () => {
     seedPool([
       {
@@ -1192,6 +1277,182 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
       await expect(pending403).rejects.toThrow()
       expect(sent).toEqual(['old-a', 'old-a'])
     } finally {
+      releaseSave.resolve()
+      save.mockRestore()
+      await captured.cleanup()
+    }
+  })
+
+  test('does not persist request success from a pool while its retirement is pending', async () => {
+    seedPool([
+      {
+        email: 'a@example.test',
+        refreshToken: 'old-a',
+        addedAt: 1,
+        lastUsed: 1,
+        enabled: true,
+      },
+    ])
+    const saveStarted = deferred<void>()
+    const releaseSave = deferred<void>()
+    const sentAgain = deferred<void>()
+    const releaseSecondResponse = deferred<Response>()
+    let sendCount = 0
+    let saveCount = 0
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'new-a',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: 'project',
+      }),
+      refreshAntigravityToken: async (refresh) => ({
+        refresh,
+        access: refresh,
+        expires: Date.now() + 600_000,
+      }),
+      ensureProjectContext: async (auth) => ({
+        auth,
+        projectId: 'project',
+        effectiveProjectId: 'project',
+      }),
+      send: async () => {
+        sendCount++
+        if (sendCount === 2) {
+          sentAgain.resolve()
+          return releaseSecondResponse.promise
+        }
+        return successResponse()
+      },
+    })
+    const save = spyOn(
+      defaultAccountStorageStore,
+      'saveMerged',
+    ).mockImplementation(async (file, next) => {
+      saveCount++
+      if (saveCount === 1) {
+        saveStarted.resolve()
+        await releaseSave.promise
+      }
+      return saveAccountStorage(file, next)
+    })
+    try {
+      expect((await titleRequest(captured.hook)).ok).toBe(true)
+      await saveStarted.promise
+      const pendingRequest = titleRequest(captured.hook)
+      await sentAgain.promise
+      const oauthCallback = (await captured.oauth.authorize()).callback
+      await Bun.sleep(10)
+      releaseSecondResponse.resolve(successResponse())
+      expect((await pendingRequest).ok).toBe(true)
+      expect(saveCount).toBe(1)
+      releaseSave.resolve()
+      await oauthCallback
+      expect(saveCount).toBe(1)
+    } finally {
+      releaseSave.resolve()
+      releaseSecondResponse.resolve(successResponse())
+      save.mockRestore()
+      await captured.cleanup()
+    }
+  })
+
+  test('aborts a sent failure while it is waiting for pool retirement', async () => {
+    seedPool([
+      {
+        email: 'a@example.test',
+        refreshToken: 'old-a',
+        addedAt: 1,
+        lastUsed: 1,
+        enabled: true,
+      },
+      {
+        email: 'b@example.test',
+        refreshToken: 'token-b',
+        addedAt: 2,
+        lastUsed: 2,
+        enabled: true,
+      },
+    ])
+    const saveStarted = deferred<void>()
+    const releaseSave = deferred<void>()
+    const failureStarted = deferred<void>()
+    const releaseFailure = deferred<Response>()
+    const sent: string[] = []
+    let sendCount = 0
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'new-a',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: 'project',
+      }),
+      refreshAntigravityToken: async (refresh) => ({
+        refresh,
+        access: refresh,
+        expires: Date.now() + 600_000,
+      }),
+      ensureProjectContext: async (auth) => ({
+        auth,
+        projectId: 'project',
+        effectiveProjectId: 'project',
+      }),
+      send: async ({ auth }) => {
+        sendCount++
+        sent.push(auth.access ?? '')
+        if (sendCount === 2) {
+          failureStarted.resolve()
+          return releaseFailure.promise
+        }
+        return successResponse()
+      },
+    })
+    const save = spyOn(
+      defaultAccountStorageStore,
+      'saveMerged',
+    ).mockImplementation(async (file, next) => {
+      saveStarted.resolve()
+      await releaseSave.promise
+      return saveAccountStorage(file, next)
+    })
+    const cancelled = new AbortController()
+    try {
+      expect((await titleRequest(captured.hook)).ok).toBe(true)
+      await saveStarted.promise
+      const pendingRequest = titleRequest(captured.hook, cancelled.signal)
+      await failureStarted.promise
+      const oauthCallback = (await captured.oauth.authorize()).callback
+      await Bun.sleep(10)
+      releaseFailure.resolve(
+        new Response(JSON.stringify({ error: { message: 'limited' } }), {
+          status: 429,
+        }),
+      )
+      await Bun.sleep(10)
+      cancelled.abort()
+      await expect(pendingRequest).rejects.toThrow()
+      releaseSave.resolve()
+      await oauthCallback
+      expect(sent).toEqual(['old-a', 'old-a'])
+    } finally {
+      cancelled.abort()
+      releaseFailure.resolve(successResponse())
       releaseSave.resolve()
       save.mockRestore()
       await captured.cleanup()
@@ -1777,6 +2038,129 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
       expect(
         readPool(path).accounts.map((account) => account.refreshToken),
       ).toEqual(['token-b', 'new-a'])
+    } finally {
+      await captured.cleanup()
+    }
+  })
+
+  test('keeps a populated pool unavailable after missing OAuth readback until concrete recovery', async () => {
+    seedPool([
+      {
+        email: 'b@example.test',
+        refreshToken: 'token-b',
+        addedAt: 2,
+        lastUsed: 2,
+        enabled: true,
+      },
+    ])
+    let loads = 0
+    let writes = 0
+    let readable = false
+    const recoveredPool: AccountStorageV4 = {
+      version: 4,
+      accounts: [],
+      activeIndex: 0,
+    }
+    let sends = 0
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'new-a',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: 'project',
+      }),
+      loadAccountStorage: async (file) => {
+        loads++
+        if (loads > 1 && !readable) return null
+        if (readable && loads === 5) return recoveredPool
+        return loadAccountStorage(file)
+      },
+      mutateAccountStorage: async (file, mutator) => {
+        writes++
+        return mutateAccountStorage(file, mutator)
+      },
+      send: async () => {
+        sends++
+        return successResponse()
+      },
+    })
+    try {
+      await expect(
+        (await captured.oauth.authorize()).callback,
+      ).rejects.toMatchObject({
+        message: 'Antigravity account pool is unavailable',
+        cause: expect.objectContaining({
+          message: 'Antigravity OAuth account was not confirmed on disk',
+        }),
+      })
+      await expect((await captured.oauth.authorize()).callback).rejects.toThrow(
+        'unavailable',
+      )
+      expect(writes).toBe(1)
+      expect(sends).toBe(0)
+      readable = true
+      await expect(
+        (await captured.oauth.authorize()).callback,
+      ).resolves.toBeDefined()
+      expect(writes).toBe(2)
+      expect(
+        readPool(
+          join(
+            process.env.OPENCODE_CONFIG_DIR ?? '',
+            'antigravity-accounts.json',
+          ),
+        ).accounts.map((account) => account.refreshToken),
+      ).toEqual(['token-b', 'new-a'])
+    } finally {
+      await captured.cleanup()
+    }
+  })
+
+  test('keeps known-empty first-run recovery compatible with missing reads', async () => {
+    let loads = 0
+    let writes = 0
+    const captured = await setupPoolAdapter({
+      loadAccountStorage: async (file) => {
+        loads++
+        if (loads === 1 || loads === 2 || loads === 3) return null
+        return loadAccountStorage(file)
+      },
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'new-a',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: 'project',
+      }),
+      mutateAccountStorage: async (file, mutator) => {
+        writes++
+        return mutateAccountStorage(file, mutator)
+      },
+    })
+    try {
+      await expect((await captured.oauth.authorize()).callback).rejects.toThrow(
+        'not confirmed',
+      )
+      await expect(
+        (await captured.oauth.authorize()).callback,
+      ).resolves.toBeDefined()
+      expect(writes).toBe(2)
+      expect(loads).toBe(4)
     } finally {
       await captured.cleanup()
     }

@@ -378,6 +378,7 @@ export class AccountManager {
   private directSaves = new Set<Promise<unknown>>()
   private saveFailure: unknown = null
   private disposed = false
+  private disposeInFlight: Promise<void> | null = null
   private persistenceStopped = false
   private storageAdmission: 'open' | 'fencing' | 'stopped' = 'open'
   private fenceInFlight: Promise<void> | null = null
@@ -2152,17 +2153,54 @@ export class AccountManager {
     await Promise.all([...this.directSaves].map((save) => save.catch(() => {})))
   }
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return
+  dispose(): Promise<void> {
+    if (this.disposeInFlight) return this.disposeInFlight
     this.disposed = true
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout)
-      this.saveTimeout = null
+    const disposing = this.finishDispose()
+    this.disposeInFlight = disposing
+    void disposing
+      .finally(() => {
+        this.disposeInFlight = null
+      })
+      .catch(() => {})
+    return disposing
+  }
+
+  private async finishDispose(): Promise<void> {
+    while (true) {
+      if (this.saveTimeout) {
+        clearTimeout(this.saveTimeout)
+        this.saveTimeout = null
+      }
+      if (this.savePending && !this.saveInFlight) {
+        this.saveInFlight = this.executeSave().finally(() => {
+          this.saveInFlight = null
+        })
+      }
+
+      const directSaves = [...this.directSaves].map((save) =>
+        save.catch(() => {}),
+      )
+      const inFlight = this.saveInFlight
+      const saveQueue = this.saveQueue
+      const fenceInFlight = this.fenceInFlight?.catch(() => {})
+      await Promise.all([
+        ...directSaves,
+        ...(inFlight ? [inFlight] : []),
+        saveQueue,
+        ...(fenceInFlight ? [fenceInFlight] : []),
+      ])
+
+      if (
+        !this.savePending &&
+        !this.saveInFlight &&
+        this.directSaves.size === 0 &&
+        this.saveQueue === saveQueue &&
+        !this.fenceInFlight
+      ) {
+        return
+      }
     }
-    if (this.savePending) {
-      await this.executeSave()
-    }
-    await this.saveInFlight
   }
 
   private async executeSave(): Promise<void> {

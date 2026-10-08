@@ -681,6 +681,17 @@ export function createOpenCodeV2AntigravityPlugin(
         poolUnavailable = false
       }
 
+      const recoverAndInstallPool = async (
+        predecessor: AccountManager,
+      ): Promise<void> => {
+        const stored = await dependencies.loadAccountStorage(ACCOUNTS_FILE)
+        if (stored === null && predecessor.getTotalAccountCount() > 0) {
+          log('pool-readback-missing', 'populated pool')
+          throw new Error('Antigravity account pool readback is missing')
+        }
+        installPool(stored)
+      }
+
       const findConfirmedOAuthAccount = (
         stored: AccountStorageV4 | null,
         result: OAuthSuccess,
@@ -722,7 +733,7 @@ export function createOpenCodeV2AntigravityPlugin(
             throw new Error('Antigravity plugin is shutting down')
           if (poolUnavailable) {
             try {
-              installPool(await dependencies.loadAccountStorage(ACCOUNTS_FILE))
+              await recoverAndInstallPool(manager)
             } catch (error) {
               log('pool-recovery-read-error', errorMessage(error))
               throw new Error('Antigravity account pool is unavailable', {
@@ -734,7 +745,6 @@ export function createOpenCodeV2AntigravityPlugin(
           transition = new Promise<void>((resolve) => {
             finishTransition = resolve
           })
-          poolGeneration += 1
           const previous = manager
           try {
             await previous.flushAndStopSaving()
@@ -745,6 +755,7 @@ export function createOpenCodeV2AntigravityPlugin(
             transition = null
             throw error
           }
+          poolGeneration += 1
 
           try {
             await dependencies.mutateAccountStorage(ACCOUNTS_FILE, (current) =>
@@ -759,7 +770,7 @@ export function createOpenCodeV2AntigravityPlugin(
             log('pool-reloaded', manager.getTotalAccountCount())
           } catch (error) {
             try {
-              installPool(await dependencies.loadAccountStorage(ACCOUNTS_FILE))
+              await recoverAndInstallPool(previous)
             } catch (readError) {
               poolUnavailable = true
               log('pool-readback-error', errorMessage(readError))
@@ -883,7 +894,7 @@ export function createOpenCodeV2AntigravityPlugin(
               errorMessage(error),
             )
           }
-          generationChanged(generation)
+          await waitForSelection(generation)
         }
 
         const waitForSelection = async (
@@ -999,7 +1010,7 @@ export function createOpenCodeV2AntigravityPlugin(
                 endpoint,
                 errorMessage(error),
               )
-              generationChanged(selectedGeneration)
+              await waitForSelection(selectedGeneration)
               failure = error
               continue
             }
@@ -1014,7 +1025,9 @@ export function createOpenCodeV2AntigravityPlugin(
             if (response.ok) {
               if (
                 selectedGeneration === poolGeneration &&
-                selectedManager === manager
+                selectedManager === manager &&
+                !transition &&
+                !poolUnavailable
               ) {
                 manager.markRequestSuccess(account)
                 manager.markAccountUsed(account.index)
@@ -1025,13 +1038,13 @@ export function createOpenCodeV2AntigravityPlugin(
             }
 
             dispatchedError = new Error(`Antigravity HTTP ${response.status}`)
-            generationChanged(selectedGeneration)
+            await waitForSelection(selectedGeneration)
 
             const { reason, message } = await readErrorDetails(response)
             dispatchedError = new Error(
               `Antigravity HTTP ${response.status}${reason ? ` (${reason})` : ''}`,
             )
-            generationChanged(selectedGeneration)
+            await waitForSelection(selectedGeneration)
             log('upstream-error', response.status, reason ?? '', message)
             if (
               response.status === 404 &&

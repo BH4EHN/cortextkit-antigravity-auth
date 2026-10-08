@@ -444,6 +444,214 @@ describe('core AccountManager', () => {
     expect(memory.mergedSaves()).toBe(1)
   })
 
+  it.each([
+    ['merge', (manager: AccountManager) => manager.saveToDisk()],
+    ['replace', (manager: AccountManager) => manager.saveToDiskReplace()],
+  ] as const)('dispose waits for an in-flight direct %s save', async (_kind, save) => {
+    let release!: () => void
+    let started!: () => void
+    const saveStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          started()
+          await new Promise<void>((resolve) => {
+            release = resolve
+          })
+          return memory.store.saveMerged(path, next)
+        },
+        mutate: async (path, fn) => {
+          started()
+          await new Promise<void>((resolve) => {
+            release = resolve
+          })
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+
+    const saving = save(manager)
+    await saveStarted
+    let disposed = false
+    const disposing = manager.dispose().then(() => {
+      disposed = true
+    })
+    for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    expect(disposed).toBe(false)
+
+    release()
+    await Promise.all([saving, disposing])
+    expect(disposed).toBe(true)
+  })
+
+  it('dispose drains queued direct saves across repeated calls', async () => {
+    let releaseFirst!: () => void
+    let startedFirst!: () => void
+    let startedSecond!: () => void
+    const firstStarted = new Promise<void>((resolve) => {
+      startedFirst = resolve
+    })
+    const secondStarted = new Promise<void>((resolve) => {
+      startedSecond = resolve
+    })
+    let calls = 0
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          calls++
+          startedFirst()
+          await new Promise<void>((resolve) => {
+            releaseFirst = resolve
+          })
+          return memory.store.saveMerged(path, next)
+        },
+        mutate: async (path, fn) => {
+          calls++
+          startedSecond()
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+
+    const firstSave = manager.saveToDisk()
+    const queuedSave = manager.saveToDiskReplace()
+    await firstStarted
+    let firstDisposeDone = false
+    const firstDispose = manager.dispose().then(() => {
+      firstDisposeDone = true
+    })
+    for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    const secondDispose = manager.dispose()
+    for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    expect(firstDisposeDone).toBe(false)
+    releaseFirst()
+    await secondStarted
+    let secondDisposeDone = false
+    const observedSecondDispose = secondDispose.then(() => {
+      secondDisposeDone = true
+    })
+    for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    expect(secondDisposeDone).toBe(false)
+    await Promise.all([
+      firstSave,
+      queuedSave,
+      firstDispose,
+      observedSecondDispose,
+    ])
+    expect(calls).toBe(2)
+  })
+
+  it('dispose waits through a failed direct save without adding another write', async () => {
+    let release!: () => void
+    let started!: () => void
+    const saveStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const memory = createStore(stored)
+    let calls = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async () => {
+          calls++
+          started()
+          await new Promise<void>((resolve) => {
+            release = resolve
+          })
+          throw new Error('direct save failed')
+        },
+      },
+    })
+
+    const saving = manager.saveToDisk()
+    await saveStarted
+    let disposed = false
+    const disposing = manager.dispose().then(() => {
+      disposed = true
+    })
+    for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    expect(disposed).toBe(false)
+    release()
+    await expect(saving).rejects.toThrow('direct save failed')
+    await disposing
+    expect(disposed).toBe(true)
+    expect(calls).toBe(1)
+    expect(memory.mergedSaves()).toBe(0)
+  })
+
+  it.each([
+    true,
+    false,
+  ])('dispose waits for an accepted fence reconciliation (retrySucceeds=%s)', async (retrySucceeds) => {
+    const memory = createStore(stored)
+    let releaseRetry!: () => void
+    let retryStarted!: () => void
+    const retryStartedPromise = new Promise<void>((resolve) => {
+      retryStarted = resolve
+    })
+    let mergeAttempts = 0
+    let retryAttempts = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async () => {
+          mergeAttempts++
+          throw new Error('ELOCKED')
+        },
+        mutate: async (path, fn) => {
+          retryAttempts++
+          retryStarted()
+          await new Promise<void>((resolve, reject) => {
+            releaseRetry = () => {
+              if (!retrySucceeds) {
+                reject(new Error('retry failed'))
+                return
+              }
+              resolve()
+            }
+          })
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+
+    await expect(manager.saveToDisk()).rejects.toThrow('ELOCKED')
+    const fence = manager.flushAndStopSaving()
+    await retryStartedPromise
+    let fenceSettled = false
+    const observedFence = fence.then(
+      () => {
+        fenceSettled = true
+        return 'resolved'
+      },
+      () => {
+        fenceSettled = true
+        return 'rejected'
+      },
+    )
+    let disposed = false
+    const disposing = manager.dispose().then(() => {
+      disposed = true
+    })
+    for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    expect(fenceSettled).toBe(false)
+    expect(disposed).toBe(false)
+
+    releaseRetry()
+    expect(await observedFence).toBe(retrySucceeds ? 'resolved' : 'rejected')
+    await disposing
+    expect(disposed).toBe(true)
+    expect(mergeAttempts).toBe(1)
+    expect(retryAttempts).toBe(1)
+    expect(memory.mutations()).toBe(retrySucceeds ? 1 : 0)
+  })
+
   it('retires a clean manager without rewriting external pool metadata', async () => {
     const memory = createStore(stored)
     const manager = new AccountManager(undefined, stored, {
