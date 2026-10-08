@@ -813,20 +813,22 @@ export function createAntigravityCommands(
     // token that is not yet the persisted account identity.
     interface QuotaUpdate {
       token: string
+      outcome: 'success' | 'failure' | 'skipped'
       groups?: Partial<Record<QuotaGroup, QuotaGroupSummary>>
-      error?: string
     }
     const updates: QuotaUpdate[] = []
     for (const result of results) {
       const token = snapshot[result.index]?.refreshToken
       if (!token) continue
+      const skipped = result.status === 'disabled'
+      const success =
+        result.status === 'ok' &&
+        result.quota !== undefined &&
+        result.quota.error === undefined
       updates.push({
         token,
-        groups:
-          result.status === 'ok' && result.quota?.groups && !result.quota.error
-            ? result.quota.groups
-            : undefined,
-        error: result.status === 'error' ? result.error : result.quota?.error,
+        outcome: skipped ? 'skipped' : success ? 'success' : 'failure',
+        groups: success ? result.quota?.groups : undefined,
       })
     }
 
@@ -841,11 +843,11 @@ export function createAntigravityCommands(
       ...current,
       accounts: current.accounts.map((entry) => {
         const update = byToken.get(entry.refreshToken)
-        if (!update) return entry
-        if (update.groups) {
+        if (!update || update.outcome === 'skipped') return entry
+        if (update.outcome === 'success') {
           return {
             ...entry,
-            cachedQuota: update.groups,
+            cachedQuota: update.groups ?? {},
             cachedQuotaAccountId: quotaAccountIdentity(entry.refreshToken),
             cachedQuotaUpdatedAt: refreshedAt,
             cachedQuotaSuccessAt: refreshedAt,
@@ -870,7 +872,14 @@ export function createAntigravityCommands(
         labelByToken.set(row.token, row.label)
       }
     }
-    const failures = updates.filter((update) => update.error)
+    const successes = updates.filter(
+      (update) => update.outcome === 'success',
+    ).length
+    const failures = updates.filter((update) => update.outcome === 'failure')
+    const skipped = updates.filter(
+      (update) => update.outcome === 'skipped',
+    ).length
+    const summary = `Quota refresh complete: ${successes} successful, ${failures.length} failed, ${skipped} skipped.`
     const suffix = failures.length
       ? `\n\nRefresh failures:\n${failures
           .map(
@@ -879,14 +888,12 @@ export function createAntigravityCommands(
           )
           .join('\n')}`
       : ''
-    const fallbackText = `Quota refreshed:\n\n\`\`\`\n${formatRowsTable(refreshedRows, rt.now())}\n\`\`\`${suffix}`
+    const fallbackText = `${summary}\n\n\`\`\`\n${formatRowsTable(refreshedRows, rt.now())}\n\`\`\`${suffix}`
     if (rt.emitPanel) {
       await rt.emitPanel(
         sessionID,
         { kind: 'quota', accounts: projectPanelAccounts(refreshedRows) },
-        failures.length
-          ? `Quota refreshed. ${failures.length} account refresh(es) failed.`
-          : 'Quota refreshed.',
+        summary,
         fallbackText,
       )
     } else {

@@ -12,6 +12,7 @@ import type { CommandDefinition } from '@opencode-ai/plugin/promise/command'
 import {
   type AccountManagerView,
   type AntigravityCommandRuntime,
+  type AntigravityPanelSnapshot,
   createAntigravityCommands,
   formatRowsTable,
   parseAccountArgs,
@@ -276,6 +277,7 @@ interface RuntimeFixtures {
   runtime: AntigravityCommandRuntime
   manager: AccountManagerView & { accounts: ManagedAccount[] }
   outputs: Array<{ sessionID: string; text: string }>
+  panels: Array<{ notice: string | undefined; fallbackText: string }>
   storage: () => AccountStorageV4
   added: () => number
   quotaFetches: () => number
@@ -285,6 +287,7 @@ interface RuntimeFixtures {
 
 function createFixtures(input: {
   storage: AccountStorageV4
+  panel?: boolean
   results?: AccountQuotaResult[]
   snapshot?: AccountMetadataV3[]
   /** Applied to storage when fetchPoolQuota runs — simulates a concurrent writer. */
@@ -292,6 +295,7 @@ function createFixtures(input: {
   mutateOnFlush?: (storage: AccountStorageV4) => Promise<AccountStorageV4>
 }): RuntimeFixtures {
   const outputs: Array<{ sessionID: string; text: string }> = []
+  const panels: Array<{ notice: string | undefined; fallbackText: string }> = []
   const order: string[] = []
   let storageRef = input.storage
   let addedCount = 0
@@ -341,6 +345,18 @@ function createFixtures(input: {
     emit: async (sessionID, text) => {
       outputs.push({ sessionID, text })
     },
+    ...(input.panel
+      ? {
+          emitPanel: async (
+            _sessionID: string,
+            _snapshot: AntigravityPanelSnapshot,
+            notice: string | undefined,
+            fallbackText: string,
+          ) => {
+            panels.push({ notice, fallbackText })
+          },
+        }
+      : {}),
     log: () => {},
     now: () => FIXED_NOW,
     accountsFile: '/tmp/antigravity-accounts.json',
@@ -350,6 +366,7 @@ function createFixtures(input: {
     runtime,
     manager,
     outputs,
+    panels,
     storage: () => storageRef,
     added: () => addedCount,
     quotaFetches: () => quotaFetches,
@@ -679,6 +696,191 @@ describe('antigravity-account add', () => {
 })
 
 describe('antigravity-quota refresh write-back', () => {
+  test('disabled outcome leaves every cached quota field untouched', async () => {
+    const cached = {
+      cachedQuota: { gemini: { remainingFraction: 0.25, modelCount: 1 } },
+      cachedQuotaAccountId: quotaAccountIdentity('token-a'),
+      cachedQuotaUpdatedAt: 123,
+      cachedQuotaSuccessAt: 111,
+    }
+    const fixtures = createFixtures({
+      storage: singleStorage([
+        storageAccount('token-a', { ...cached, enabled: false }),
+      ]),
+      snapshot: [storageAccount('token-a', { enabled: false })],
+      results: [{ index: 0, status: 'disabled' }],
+    })
+    await execute(commandMap(fixtures.runtime)['antigravity-quota']!, 'refresh')
+    expect(fixtures.storage().accounts[0]).toMatchObject(cached)
+    expect(fixtures.outputs.at(-1)?.text).toContain(
+      'Quota refresh complete: 0 successful, 0 failed, 1 skipped.',
+    )
+  })
+
+  test('error without a message is a failure and preserves old quota fields', async () => {
+    const cached = {
+      cachedQuota: { gemini: { remainingFraction: 0.25, modelCount: 1 } },
+      cachedQuotaAccountId: quotaAccountIdentity('token-a'),
+      cachedQuotaUpdatedAt: 123,
+      cachedQuotaSuccessAt: 111,
+    }
+    const fixtures = createFixtures({
+      storage: singleStorage([storageAccount('token-a', cached)]),
+      snapshot: [storageAccount('token-a')],
+      results: [{ index: 0, status: 'error', disabled: true }],
+    })
+    await execute(commandMap(fixtures.runtime)['antigravity-quota']!, 'refresh')
+    expect(fixtures.storage().accounts[0]).toMatchObject({
+      ...cached,
+      cachedQuotaUpdatedAt: FIXED_NOW,
+    })
+    expect(fixtures.storage().accounts[0]?.cachedQuotaSuccessAt).toBe(111)
+    expect(fixtures.outputs.at(-1)?.text).toContain(
+      'Quota refresh complete: 0 successful, 1 failed, 0 skipped.',
+    )
+    expect(fixtures.outputs.at(-1)?.text).toContain('Account 1: refresh failed')
+  })
+
+  test('ok without a quota is a failure', async () => {
+    const fixtures = createFixtures({
+      storage: singleStorage([storageAccount('token-a')]),
+      snapshot: [storageAccount('token-a')],
+      results: [{ index: 0, status: 'ok' }],
+    })
+    await execute(commandMap(fixtures.runtime)['antigravity-quota']!, 'refresh')
+    expect(fixtures.storage().accounts[0]?.cachedQuotaUpdatedAt).toBe(FIXED_NOW)
+    expect(fixtures.storage().accounts[0]?.cachedQuotaSuccessAt).toBeUndefined()
+    expect(fixtures.outputs.at(-1)?.text).toContain(
+      'Quota refresh complete: 0 successful, 1 failed, 0 skipped.',
+    )
+  })
+
+  test('empty groups are a successful snapshot and panel/text summaries match', async () => {
+    const fixtures = createFixtures({
+      panel: true,
+      storage: singleStorage([storageAccount('token-a')]),
+      snapshot: [storageAccount('token-a')],
+      results: [
+        { index: 0, status: 'ok', quota: { groups: {}, modelCount: 0 } },
+      ],
+    })
+    await execute(commandMap(fixtures.runtime)['antigravity-quota']!, 'refresh')
+    expect(fixtures.storage().accounts[0]?.cachedQuota).toEqual({})
+    expect(fixtures.storage().accounts[0]?.cachedQuotaAccountId).toBe(
+      quotaAccountIdentity('token-a'),
+    )
+    expect(fixtures.storage().accounts[0]?.cachedQuotaSuccessAt).toBe(FIXED_NOW)
+    const summary = 'Quota refresh complete: 1 successful, 0 failed, 0 skipped.'
+    expect(fixtures.panels[0]?.notice).toBe(summary)
+    expect(fixtures.panels[0]?.fallbackText.startsWith(summary)).toBe(true)
+    expect(fixtures.panels[0]?.fallbackText).not.toContain('Quota refreshed')
+  })
+
+  test('mixed outcomes share success, failure, and skipped counts', async () => {
+    const successCache = {
+      cachedQuota: {
+        'non-gemini': { remainingFraction: 0.2, modelCount: 1 },
+      },
+      cachedQuotaAccountId: quotaAccountIdentity('token-a'),
+      cachedQuotaUpdatedAt: 10,
+      cachedQuotaSuccessAt: 9,
+    }
+    const failureCache = {
+      cachedQuota: { gemini: { remainingFraction: 0.3, modelCount: 2 } },
+      cachedQuotaAccountId: quotaAccountIdentity('token-b'),
+      cachedQuotaUpdatedAt: 20,
+      cachedQuotaSuccessAt: 19,
+    }
+    const skippedCache = {
+      cachedQuota: { gemini: { remainingFraction: 0.4, modelCount: 3 } },
+      cachedQuotaAccountId: quotaAccountIdentity('token-c'),
+      cachedQuotaUpdatedAt: 30,
+      cachedQuotaSuccessAt: 29,
+    }
+    const fixtures = createFixtures({
+      panel: true,
+      storage: singleStorage([
+        storageAccount('token-a', successCache),
+        storageAccount('token-b', failureCache),
+        storageAccount('token-c', { ...skippedCache, enabled: false }),
+      ]),
+      snapshot: [
+        storageAccount('token-a'),
+        storageAccount('token-b'),
+        storageAccount('token-c', { enabled: false }),
+      ],
+      results: [
+        { index: 0, status: 'ok', quota: { groups: {}, modelCount: 0 } },
+        { index: 1, status: 'error' },
+        { index: 2, status: 'disabled' },
+      ],
+    })
+    await execute(commandMap(fixtures.runtime)['antigravity-quota']!, 'refresh')
+    const summary = 'Quota refresh complete: 1 successful, 1 failed, 1 skipped.'
+    expect(fixtures.panels[0]?.notice).toBe(summary)
+    expect(fixtures.panels[0]?.fallbackText.startsWith(summary)).toBe(true)
+    const [success, failure, skipped] = fixtures.storage().accounts
+    expect(success).toMatchObject({
+      cachedQuota: {},
+      cachedQuotaAccountId: quotaAccountIdentity('token-a'),
+      cachedQuotaUpdatedAt: FIXED_NOW,
+      cachedQuotaSuccessAt: FIXED_NOW,
+    })
+    expect(failure).toMatchObject({
+      ...failureCache,
+      cachedQuotaUpdatedAt: FIXED_NOW,
+    })
+    expect(failure?.cachedQuotaSuccessAt).toBe(
+      failureCache.cachedQuotaSuccessAt,
+    )
+    expect(skipped).toMatchObject({ ...skippedCache, enabled: false })
+  })
+
+  test('all failures and all skipped avoid success claims in panel and text output', async () => {
+    const scenarios = [
+      {
+        enabled: true,
+        result: { index: 0, status: 'error' as const },
+        summary: 'Quota refresh complete: 0 successful, 1 failed, 0 skipped.',
+      },
+      {
+        enabled: false,
+        result: { index: 0, status: 'disabled' as const },
+        summary: 'Quota refresh complete: 0 successful, 0 failed, 1 skipped.',
+      },
+    ]
+    for (const scenario of scenarios) {
+      const storage = singleStorage([
+        storageAccount('token-a', { enabled: scenario.enabled }),
+      ])
+      const input = {
+        storage,
+        snapshot: [storageAccount('token-a', { enabled: scenario.enabled })],
+        results: [scenario.result],
+      }
+      const textFixtures = createFixtures(input)
+      await execute(
+        commandMap(textFixtures.runtime)['antigravity-quota']!,
+        'refresh',
+      )
+      expect(textFixtures.outputs.at(-1)?.text).toContain(scenario.summary)
+      expect(textFixtures.outputs.at(-1)?.text).not.toContain('Quota refreshed')
+
+      const panelFixtures = createFixtures({ ...input, panel: true })
+      await execute(
+        commandMap(panelFixtures.runtime)['antigravity-quota']!,
+        'refresh',
+      )
+      expect(panelFixtures.panels[0]?.notice).toBe(scenario.summary)
+      expect(
+        panelFixtures.panels[0]?.fallbackText.startsWith(scenario.summary),
+      ).toBe(true)
+      expect(panelFixtures.panels[0]?.fallbackText).not.toContain(
+        'Quota refreshed',
+      )
+    }
+  })
+
   test('uses the original snapshot token when quota refresh rotates a token', async () => {
     const fixtures = createFixtures({
       storage: singleStorage([storageAccount('token-before')]),
