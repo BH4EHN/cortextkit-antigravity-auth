@@ -644,6 +644,7 @@ export function createOpenCodeV2AntigravityPlugin(
       let transition: Promise<void> | null = null
       let finishTransition: (() => void) | null = null
       let mutationTail: Promise<void> = Promise.resolve()
+      let shuttingDown = false
       log('setup-start', 'accounts', manager.getTotalAccountCount())
 
       const waitForPool = async (signal?: AbortSignal): Promise<void> => {
@@ -669,20 +670,47 @@ export function createOpenCodeV2AntigravityPlugin(
           throw new Error('Antigravity account pool is unavailable')
       }
 
-      const installAuthoritativePool = async (): Promise<void> => {
-        accounts = await dependencies.loadAccountStorage(ACCOUNTS_FILE)
-        manager = new AccountManager(undefined, accounts, {
+      const installPool = (stored: AccountStorageV4 | null): void => {
+        const replacement = new AccountManager(undefined, stored, {
           store: defaultAccountStorageStore,
           storagePath: ACCOUNTS_FILE,
         })
+        accounts = stored
+        manager = replacement
         poolGeneration += 1
         poolUnavailable = false
+      }
+
+      const findConfirmedOAuthAccount = (
+        stored: AccountStorageV4 | null,
+        result: OAuthSuccess,
+      ) => {
+        const refreshToken = parseRefreshParts(result.refresh).refreshToken
+        return stored?.accounts.find((account) =>
+          result.email
+            ? account.email === result.email
+            : account.refreshToken === refreshToken,
+        )
+      }
+
+      const isConfirmedOAuthAccount = (
+        stored: AccountStorageV4 | null,
+        result: OAuthSuccess,
+      ): boolean => {
+        const refreshToken = parseRefreshParts(result.refresh).refreshToken
+        const saved = findConfirmedOAuthAccount(stored, result)
+        return !!(
+          saved &&
+          saved.refreshToken === refreshToken &&
+          saved.enabled !== false
+        )
       }
 
       const upsertPool = async (
         result: OAuthSuccess,
         now: number,
       ): Promise<void> => {
+        if (shuttingDown) throw new Error('Antigravity plugin is shutting down')
         const predecessor = mutationTail
         let release!: () => void
         mutationTail = new Promise<void>((resolve) => {
@@ -690,9 +718,11 @@ export function createOpenCodeV2AntigravityPlugin(
         })
         await predecessor
         try {
+          if (shuttingDown)
+            throw new Error('Antigravity plugin is shutting down')
           if (poolUnavailable) {
             try {
-              await installAuthoritativePool()
+              installPool(await dependencies.loadAccountStorage(ACCOUNTS_FILE))
             } catch (error) {
               log('pool-recovery-read-error', errorMessage(error))
               throw new Error('Antigravity account pool is unavailable', {
@@ -707,33 +737,29 @@ export function createOpenCodeV2AntigravityPlugin(
           poolGeneration += 1
           const previous = manager
           try {
-            await previous.flushSaveToDisk({ strict: true })
-            await previous.stopSaving()
+            await previous.flushAndStopSaving()
+          } catch (error) {
+            log('pool-save-fence-error', errorMessage(error))
+            finishTransition?.()
+            finishTransition = null
+            transition = null
+            throw error
+          }
+
+          try {
             await dependencies.mutateAccountStorage(ACCOUNTS_FILE, (current) =>
               upsertOAuthAccount(current, result, now),
             )
-            await installAuthoritativePool()
-            const refreshToken = parseRefreshParts(result.refresh).refreshToken
-            const saved = accounts?.accounts.find((account) =>
-              result.email
-                ? account.email === result.email
-                : account.refreshToken === refreshToken,
-            )
-            if (
-              !saved ||
-              saved.refreshToken !== refreshToken ||
-              saved.enabled === false
-            )
+            const stored = await dependencies.loadAccountStorage(ACCOUNTS_FILE)
+            if (!isConfirmedOAuthAccount(stored, result))
               throw new Error(
                 'Antigravity OAuth account was not confirmed on disk',
               )
+            installPool(stored)
             log('pool-reloaded', manager.getTotalAccountCount())
           } catch (error) {
-            await previous.stopSaving().catch((stopError) => {
-              log('pool-saver-stop-error', errorMessage(stopError))
-            })
             try {
-              await installAuthoritativePool()
+              installPool(await dependencies.loadAccountStorage(ACCOUNTS_FILE))
             } catch (readError) {
               poolUnavailable = true
               log('pool-readback-error', errorMessage(readError))
@@ -840,6 +866,24 @@ export function createOpenCodeV2AntigravityPlugin(
               )
             )
           return true
+        }
+
+        const persistAccountState = async (
+          selectedManager: AccountManager,
+          account: ManagedAccount,
+          generation: number,
+        ): Promise<void> => {
+          generationChanged(generation)
+          try {
+            await selectedManager.flushSaveToDisk()
+          } catch (error) {
+            log(
+              'account-state-save-error',
+              `#${account.index}`,
+              errorMessage(error),
+            )
+          }
+          generationChanged(generation)
         }
 
         const waitForSelection = async (
@@ -1019,28 +1063,27 @@ export function createOpenCodeV2AntigravityPlugin(
             }
 
             if (response.status === 403 && reason === 'ACCOUNT_INELIGIBLE') {
-              manager.markAccountIneligible(account.index, reason)
-              try {
-                await manager.flushSaveToDisk()
-              } catch (error) {
-                generationChanged(selectedGeneration)
-                throw error
-              }
-              generationChanged(selectedGeneration)
+              selectedManager.markAccountIneligible(account.index, reason)
+              await persistAccountState(
+                selectedManager,
+                account,
+                selectedGeneration,
+              )
               excluded.add(account.index)
               failure = new Error('Antigravity account is ineligible')
               break
             }
 
             if (response.status === 403 && reason === 'VALIDATION_REQUIRED') {
-              manager.markAccountVerificationRequired(account.index, reason)
-              try {
-                await manager.flushSaveToDisk()
-              } catch (error) {
-                generationChanged(selectedGeneration)
-                throw error
-              }
-              generationChanged(selectedGeneration)
+              selectedManager.markAccountVerificationRequired(
+                account.index,
+                reason,
+              )
+              await persistAccountState(
+                selectedManager,
+                account,
+                selectedGeneration,
+              )
               excluded.add(account.index)
               failure = new Error('Antigravity account requires validation')
               break
@@ -1481,6 +1524,8 @@ export function createOpenCodeV2AntigravityPlugin(
               label: 'Google Antigravity (add account)',
             },
             authorize: async () => {
+              if (shuttingDown)
+                throw new Error('Antigravity plugin is shutting down')
               const authorization = await dependencies.authorizeAntigravity()
               const state = new URL(authorization.url).searchParams.get('state')
               if (!state) {
@@ -1558,6 +1603,7 @@ export function createOpenCodeV2AntigravityPlugin(
       )
 
       return async () => {
+        shuttingDown = true
         for (const registration of registrations.reverse()) {
           await registration
             .dispose()
@@ -1570,12 +1616,20 @@ export function createOpenCodeV2AntigravityPlugin(
         for (const timer of jobTimers.values()) clearTimeout(timer)
         jobTimers.clear()
         for (const controller of activeControllers) controller.abort()
+        await mutationTail
         server.closeAllConnections?.()
         await new Promise<void>((resolve) => server.close(() => resolve()))
         requestSessions.clear()
-        await manager
-          .flushSaveToDisk()
-          .catch((error) => log('pool-flush-error', errorMessage(error)))
+        try {
+          await manager.flushAndStopSaving()
+        } catch (error) {
+          log('pool-flush-error', errorMessage(error))
+          await manager
+            .stopSaving()
+            .catch((stopError) =>
+              log('pool-saver-stop-error', errorMessage(stopError)),
+            )
+        }
         await manager
           .dispose()
           .catch((error) => log('pool-dispose-error', errorMessage(error)))

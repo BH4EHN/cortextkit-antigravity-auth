@@ -6,7 +6,11 @@ export type {
   AccountSessionIdentity,
   ManagedAccount,
 } from './account-manager.ts'
-export { AccountManager, resolveQuotaGroup } from './account-manager.ts'
+export {
+  AccountManager,
+  AccountManagerPersistenceError,
+  resolveQuotaGroup,
+} from './account-manager.ts'
 export * from './account-storage.ts'
 export * from './account-types.ts'
 export * from './agy-request-metadata.ts'

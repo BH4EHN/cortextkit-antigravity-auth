@@ -1,6 +1,10 @@
 import { describe, expect, it, jest } from 'bun:test'
-import { AccountManager } from './account-manager.ts'
+import {
+  AccountManager,
+  AccountManagerPersistenceError,
+} from './account-manager.ts'
 import type { AccountStorageStore } from './account-storage.ts'
+import { mergeAccountStorage } from './account-storage.ts'
 import type { AccountStorageV4 } from './account-types.ts'
 
 function createStore(initial: AccountStorageV4 | null = null) {
@@ -438,6 +442,807 @@ describe('core AccountManager', () => {
     manager.requestSaveToDisk()
     await manager.dispose()
     expect(memory.mergedSaves()).toBe(1)
+  })
+
+  it('retires a clean manager without rewriting external pool metadata', async () => {
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: memory.store,
+    })
+    await memory.store.mutate('', (current) => ({
+      ...current,
+      accounts: current.accounts.map((account, index) =>
+        index === 0 ? { ...account, label: 'external edit' } : account,
+      ),
+    }))
+    await manager.flushAndStopSaving()
+    expect(memory.mergedSaves()).toBe(0)
+    expect(memory.state()?.accounts[0]?.label).toBe('external edit')
+    await expect(manager.saveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+  })
+
+  it('keeps a lock-failed deferred save retryable on the same manager', async () => {
+    const memory = createStore(stored)
+    let locked = true
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          if (locked) throw new Error('ELOCKED')
+          return memory.store.saveMerged(path, next)
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toBeInstanceOf(
+      AccountManagerPersistenceError,
+    )
+    locked = false
+    await manager.flushAndStopSaving()
+    expect(memory.mutations()).toBe(1)
+    expect(memory.state()?.accounts).toHaveLength(2)
+  })
+
+  it('lets an ordinary save continue after a retryable fence', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      let locked = true
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path, next) => {
+            if (locked) throw new Error('ELOCKED')
+            return memory.store.saveMerged(path, next)
+          },
+        },
+      })
+      manager.requestSaveToDisk()
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'retryable',
+      })
+      locked = false
+      manager.requestSaveToDisk()
+      const ordinary = manager.flushSaveToDisk({ strict: true })
+      await jest.advanceTimersByTime(1000)
+      await expect(ordinary).resolves.toBeUndefined()
+      await manager.flushAndStopSaving()
+      expect(memory.state()?.accounts).toHaveLength(2)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('confirms a post-write error by read-back without replaying it', async () => {
+    const memory = createStore(stored)
+    let calls = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          calls++
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          throw new Error('response lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await manager.flushAndStopSaving()
+    expect(calls).toBe(1)
+  })
+
+  it('holds an ambiguous write fenced until read-back can confirm it', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let loadCalls = 0
+    let calls = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          loadCalls++
+          if (loadCalls === 1) return memory.store.load(path)
+          if (!readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async (path, next) => {
+          calls++
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          throw new Error('response lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    await expect(manager.saveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    readable = true
+    await manager.flushAndStopSaving()
+    expect(calls).toBe(1)
+  })
+
+  it('confirms the original nested snapshot and then saves late intent', async () => {
+    const memory = createStore(stored)
+    let releaseRead!: () => void
+    let readStarted!: () => void
+    const reading = new Promise<void>((resolve) => {
+      readStarted = resolve
+    })
+    let loadCalls = 0
+    let saves = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          loadCalls++
+          if (loadCalls === 2) {
+            readStarted()
+            await new Promise<void>((resolve) => {
+              releaseRead = resolve
+            })
+          }
+          return memory.store.load(path)
+        },
+        saveMerged: async (path, next) => {
+          saves++
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          if (saves === 1) throw new Error('response lost')
+          return next
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    const fence = manager.flushAndStopSaving()
+    await reading
+    manager.getAccounts()[0]!.rateLimitResetTimes.claude = 999
+    manager.requestSaveToDisk()
+    releaseRead()
+    await fence
+    expect(saves).toBe(2)
+    expect(memory.state()?.accounts[0]?.rateLimitResetTimes?.claude).toBe(999)
+  })
+
+  it('does not require a readable baseline for an ordinary successful save', async () => {
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async () => {
+          throw new Error('read unavailable')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await manager.flushAndStopSaving()
+    expect(memory.mergedSaves()).toBe(1)
+  })
+
+  it('does not infer a failed write from read-back without its baseline', async () => {
+    const memory = createStore(stored)
+    let loadCalls = 0
+    let saves = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          loadCalls++
+          if (loadCalls === 1) throw new Error('baseline unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async (path, next) => {
+          saves++
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          throw new Error('response lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(saves).toBe(1)
+  })
+
+  it('closes direct-save admission and drains a late requested save', async () => {
+    const memory = createStore(stored)
+    let release!: () => void
+    let started!: () => void
+    const firstStarted = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    let calls = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          calls++
+          if (calls === 1) {
+            started()
+            await new Promise<void>((resolve) => {
+              release = resolve
+            })
+          }
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          return next
+        },
+      },
+    })
+    const direct = manager.saveToDisk()
+    await firstStarted
+    const fence = manager.flushAndStopSaving()
+    await expect(manager.saveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    manager.getAccounts()[0]!.label = 'late'
+    manager.requestSaveToDisk()
+    release()
+    await Promise.all([direct, fence])
+    expect(calls).toBe(2)
+    expect(memory.state()?.accounts[0]?.label).toBe('late')
+  })
+
+  it('keeps a failed replacement fenced when read-back differs from both states', async () => {
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        mutate: async (path, fn) => {
+          await memory.store.mutate(path, fn)
+          await memory.store.mutate(path, (current) => ({
+            ...current,
+            accounts: current.accounts.map((account, index) =>
+              index === 0 ? { ...account, label: 'external' } : account,
+            ),
+          }))
+          throw new Error('response lost')
+        },
+      },
+    })
+    const replacement = manager.saveToDiskReplace()
+    await expect(replacement).rejects.toThrow('response lost')
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(memory.state()?.accounts[0]?.label).toBe('external')
+    await expect(manager.saveToDiskReplace()).rejects.toThrow(
+      'persistence has stopped',
+    )
+  })
+
+  it('does not replay a failed replacement over a changed pool', async () => {
+    const memory = createStore(stored)
+    let locked = true
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        mutate: async (path, fn) => {
+          if (locked) throw new Error('ELOCKED')
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+    manager.removeAccountByIndex(0)
+    await expect(manager.saveToDiskReplace()).rejects.toThrow('ELOCKED')
+    await memory.store.mutate('', (current) => ({
+      ...current,
+      accounts: current.accounts.map((account, index) =>
+        index === 0 ? { ...account, label: 'external' } : account,
+      ),
+    }))
+    locked = false
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(
+      memory.state()?.accounts.map((account) => account.refreshToken),
+    ).toEqual(['r1', 'r2'])
+    expect(memory.state()?.accounts[0]?.label).toBe('external')
+  })
+
+  it('retries the exact failed replacement and keeps the removal', async () => {
+    const memory = createStore(stored)
+    let locked = true
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        mutate: async (path, fn) => {
+          if (locked) throw new Error('ELOCKED')
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+    manager.removeAccountByIndex(0)
+    await expect(manager.saveToDiskReplace()).rejects.toThrow('ELOCKED')
+    locked = false
+    await manager.flushAndStopSaving()
+    expect(
+      memory.state()?.accounts.map((account) => account.refreshToken),
+    ).toEqual(['r2'])
+    expect(memory.mergedSaves()).toBe(0)
+  })
+
+  it('rejects a failed merge retry after external token rotation', async () => {
+    const memory = createStore(stored)
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async () => {
+          throw new Error('ELOCKED')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'retryable',
+    })
+    await memory.store.mutate('', (current) => ({
+      ...current,
+      accounts: current.accounts.map((account, index) =>
+        index === 0 ? { ...account, refreshToken: 'rotated' } : account,
+      ),
+    }))
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(
+      memory.state()?.accounts.map((account) => account.refreshToken),
+    ).toEqual(['rotated', 'r2'])
+    expect(memory.mutations()).toBe(2)
+  })
+
+  for (const kind of ['merge', 'replace'] as const) {
+    it(`retains a newer ${kind} intent when reconciliation fails again`, async () => {
+      const memory = createStore(stored)
+      let locked = true
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path, next) => {
+            if (locked) throw new Error('ELOCKED')
+            return memory.store.saveMerged(path, next)
+          },
+          mutate: async (path, fn) => {
+            if (locked) throw new Error('ELOCKED')
+            return memory.store.mutate(path, fn)
+          },
+        },
+      })
+      await expect(manager.saveToDisk()).rejects.toThrow('ELOCKED')
+      manager.getAccounts()[1]!.label = 'retained newer intent'
+      manager.getAccounts()[1]!.rateLimitResetTimes.claude = 999
+      if (kind === 'replace') manager.removeAccountByIndex(0)
+      const newer =
+        kind === 'replace' ? manager.saveToDiskReplace() : manager.saveToDisk()
+      await expect(newer).rejects.toThrow('ELOCKED')
+      locked = false
+      await manager.flushAndStopSaving()
+      expect(
+        memory
+          .state()
+          ?.accounts.find((account) => account.refreshToken === 'r2'),
+      ).toMatchObject({
+        label: 'retained newer intent',
+        rateLimitResetTimes: { claude: 999 },
+      })
+      expect(
+        memory.state()?.accounts.map((account) => account.refreshToken),
+      ).toEqual(kind === 'replace' ? ['r2'] : ['r1', 'r2'])
+    })
+  }
+
+  it('keeps a deferred replacement from overwriting a concurrent edit after recovery', async () => {
+    const memory = createStore(stored)
+    let locked = true
+    let mutations = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async () => {
+          throw new Error('ELOCKED')
+        },
+        mutate: async (path, fn) => {
+          if (locked) throw new Error('ELOCKED')
+          mutations++
+          if (mutations === 2) {
+            await memory.store.mutate(path, (current) => ({
+              ...current,
+              accounts: current.accounts.map((account, index) =>
+                index === 0
+                  ? { ...account, refreshToken: 'externally-rotated' }
+                  : account,
+              ),
+            }))
+          }
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+    await expect(manager.saveToDisk()).rejects.toThrow('ELOCKED')
+    manager.removeAccountByIndex(0)
+    await expect(manager.saveToDiskReplace()).rejects.toThrow('ELOCKED')
+    locked = false
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(
+      memory.state()?.accounts.map((account) => account.refreshToken),
+    ).toEqual(['externally-rotated', 'r2'])
+    expect(manager.getAccounts()[0]?.parts.refreshToken).toBe('r2')
+    await expect(manager.saveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+  })
+
+  it('serializes a queued new save with fence reconciliation of an older failure', async () => {
+    const memory = createStore(stored)
+    let retryCalls = 0
+    let mergedCalls = 0
+    let releaseRetry!: () => void
+    let retryStarted!: () => void
+    const retrying = new Promise<void>((resolve) => {
+      retryStarted = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      releaseRetry = resolve
+    })
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          mergedCalls++
+          if (mergedCalls === 1) throw new Error('ELOCKED')
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          return next
+        },
+        mutate: async (path, fn) => {
+          retryCalls++
+          if (retryCalls === 1) {
+            retryStarted()
+            await gate
+          }
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+    await expect(manager.saveToDisk()).rejects.toThrow('ELOCKED')
+    manager.getAccounts()[0]!.label = 'new intent'
+    const second = manager.saveToDisk()
+    const fence = manager.flushAndStopSaving()
+    await retrying
+    await Promise.resolve()
+    await Promise.resolve()
+    const callsBeforeRelease = retryCalls
+    releaseRetry()
+    const results = await Promise.allSettled([second, fence])
+    expect(callsBeforeRelease).toBe(1)
+    expect(results.map((result) => result.status)).toEqual([
+      'fulfilled',
+      'fulfilled',
+    ])
+    expect(memory.state()?.accounts[0]?.label).toBe('new intent')
+  })
+
+  for (const kind of ['merge', 'replace'] as const) {
+    it(`captures queued ${kind} save snapshots at invocation time`, async () => {
+      const initial: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          ...stored.accounts,
+          { refreshToken: 'r3', projectId: 'p3', addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      }
+      const memory = createStore(initial)
+      let releaseFirst!: () => void
+      let firstStarted!: () => void
+      const firstStartedPromise = new Promise<void>((resolve) => {
+        firstStarted = resolve
+      })
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve
+      })
+      const writes: Array<{ operation: string; state: AccountStorageV4 }> = []
+      const record = async (
+        operation: string,
+        state: AccountStorageV4,
+      ): Promise<void> => {
+        const attempt = writes.length + 1
+        writes.push({ operation, state: structuredClone(state) })
+        if (attempt === 1) {
+          firstStarted()
+          await firstGate
+        }
+        if (attempt === 2) throw new Error('ELOCKED')
+      }
+      const manager = new AccountManager(undefined, initial, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path, next) => {
+            await record('merge', next)
+            await memory.store.mutate(path, (current) =>
+              mergeAccountStorage(current, next),
+            )
+            return next
+          },
+          mutate: async (path, fn) => {
+            const current = memory.state() ?? {
+              version: 4 as const,
+              accounts: [],
+              activeIndex: 0,
+            }
+            const next = await fn(current)
+            if (!next) return current
+            await record('replace', next)
+            return memory.store.mutate(path, () => next)
+          },
+        },
+      })
+      // Keep collection edits local to the explicit saves under observation.
+      manager.requestSaveToDisk = () => {}
+
+      const first = manager.saveToDisk()
+      await firstStartedPromise
+
+      if (kind === 'replace') manager.removeAccountByIndex(0)
+      const secondAccount = manager
+        .getAccounts()
+        .find((account) => account.parts.refreshToken === 'r3')!
+      secondAccount.label = 'second snapshot'
+      secondAccount.rateLimitResetTimes.claude = 333
+      const second =
+        kind === 'replace' ? manager.saveToDiskReplace() : manager.saveToDisk()
+      const secondExpectedTokens =
+        kind === 'replace' ? ['r2', 'r3'] : ['r1', 'r2', 'r3']
+      manager.removeAccountByIndex(0)
+      const thirdAccount = manager
+        .getAccounts()
+        .find((account) => account.parts.refreshToken === 'r3')!
+      thirdAccount.label = 'third snapshot'
+      thirdAccount.rateLimitResetTimes.claude = 777
+      const third =
+        kind === 'replace' ? manager.saveToDiskReplace() : manager.saveToDisk()
+      const fence = manager.flushAndStopSaving()
+
+      releaseFirst()
+      const results = await Promise.allSettled([first, second, third, fence])
+      expect(results.map((result) => result.status)).toEqual([
+        'fulfilled',
+        'rejected',
+        'fulfilled',
+        'fulfilled',
+      ])
+      expect((results[1] as PromiseRejectedResult).reason).toMatchObject({
+        message: 'ELOCKED',
+      })
+      expect(writes.map((write) => write.operation)).toEqual(
+        kind === 'merge'
+          ? ['merge', 'merge', 'replace', 'replace']
+          : ['merge', 'replace', 'replace', 'replace'],
+      )
+      expect(
+        writes[1]!.state.accounts.map((account) => account.refreshToken),
+      ).toEqual(secondExpectedTokens)
+      expect(
+        writes[2]!.state.accounts.find(
+          (account) => account.refreshToken === 'r3',
+        )?.label,
+      ).toBe('second snapshot')
+      expect(
+        writes[3]!.state.accounts.map((account) => account.refreshToken),
+      ).toEqual(kind === 'replace' ? ['r3'] : ['r1', 'r2', 'r3'])
+      expect(
+        writes[3]!.state.accounts.find(
+          (account) => account.refreshToken === 'r3',
+        ),
+      ).toMatchObject({
+        label: 'third snapshot',
+        rateLimitResetTimes: { claude: 777 },
+      })
+      expect(
+        memory.state()?.accounts.map((account) => account.refreshToken),
+      ).toEqual(kind === 'replace' ? ['r3'] : ['r1', 'r2', 'r3'])
+      expect(
+        memory
+          .state()
+          ?.accounts.find((account) => account.refreshToken === 'r3'),
+      ).toMatchObject({
+        label: 'third snapshot',
+        rateLimitResetTimes: { claude: 777 },
+      })
+    })
+  }
+
+  for (const kind of ['merge', 'replace'] as const) {
+    it(`fence retry keeps a failed ${kind} intent after later memory changes`, async () => {
+      const initial: AccountStorageV4 = {
+        version: 4,
+        accounts: [
+          ...stored.accounts,
+          { refreshToken: 'r3', projectId: 'p3', addedAt: 1, lastUsed: 0 },
+        ],
+        activeIndex: 0,
+      }
+      const memory = createStore(initial)
+      let releaseFirst!: () => void
+      let firstStarted!: () => void
+      const firstStartedPromise = new Promise<void>((resolve) => {
+        firstStarted = resolve
+      })
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve
+      })
+      const writes: Array<{ operation: string; state: AccountStorageV4 }> = []
+      const record = async (
+        operation: string,
+        state: AccountStorageV4,
+      ): Promise<void> => {
+        const attempt = writes.length + 1
+        writes.push({ operation, state: structuredClone(state) })
+        if (attempt === 1) {
+          firstStarted()
+          await firstGate
+        }
+        if (attempt === 2) throw new Error('ELOCKED')
+      }
+      const manager = new AccountManager(undefined, initial, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path, next) => {
+            await record('merge', next)
+            await memory.store.mutate(path, (current) =>
+              mergeAccountStorage(current, next),
+            )
+            return next
+          },
+          mutate: async (path, fn) => {
+            const current = memory.state() ?? {
+              version: 4 as const,
+              accounts: [],
+              activeIndex: 0,
+            }
+            const next = await fn(current)
+            if (!next) return current
+            await record('replace', next)
+            return memory.store.mutate(path, () => next)
+          },
+        },
+      })
+      manager.requestSaveToDisk = () => {}
+
+      const first = manager.saveToDisk()
+      await firstStartedPromise
+
+      if (kind === 'replace') manager.removeAccountByIndex(0)
+      const secondAccount = manager
+        .getAccounts()
+        .find((account) => account.parts.refreshToken === 'r3')!
+      secondAccount.label = 'second snapshot'
+      secondAccount.rateLimitResetTimes.claude = 333
+      const second =
+        kind === 'replace' ? manager.saveToDiskReplace() : manager.saveToDisk()
+      const secondExpectedTokens =
+        kind === 'replace' ? ['r2', 'r3'] : ['r1', 'r2', 'r3']
+
+      // These edits happen after the second intent is frozen and before it
+      // reaches its failing write.
+      manager.removeAccountByIndex(0)
+      const changedAccount = manager
+        .getAccounts()
+        .find((account) => account.parts.refreshToken === 'r3')!
+      changedAccount.label = 'changed before failure'
+      changedAccount.rateLimitResetTimes.claude = 555
+
+      releaseFirst()
+      await first
+      await expect(second).rejects.toThrow('ELOCKED')
+
+      // Mutate again after ELOCKED, without admitting another direct save.
+      changedAccount.label = 'changed after failure'
+      changedAccount.rateLimitResetTimes.claude = 999
+      await manager.flushAndStopSaving()
+
+      expect(writes.map((write) => write.operation)).toEqual(
+        kind === 'merge'
+          ? ['merge', 'merge', 'replace']
+          : ['merge', 'replace', 'replace'],
+      )
+      expect(
+        writes[1]!.state.accounts.map((account) => account.refreshToken),
+      ).toEqual(secondExpectedTokens)
+      expect(
+        writes[1]!.state.accounts.find(
+          (account) => account.refreshToken === 'r3',
+        ),
+      ).toMatchObject({
+        label: 'second snapshot',
+        rateLimitResetTimes: { claude: 333 },
+      })
+      expect(
+        writes[2]!.state.accounts.map((account) => account.refreshToken),
+      ).toEqual(secondExpectedTokens)
+      expect(
+        writes[2]!.state.accounts.find(
+          (account) => account.refreshToken === 'r3',
+        ),
+      ).toMatchObject({
+        label: 'second snapshot',
+        rateLimitResetTimes: { claude: 333 },
+      })
+      expect(
+        memory.state()?.accounts.map((account) => account.refreshToken),
+      ).toEqual(kind === 'replace' ? ['r2', 'r3'] : ['r1', 'r2', 'r3'])
+      expect(
+        memory
+          .state()
+          ?.accounts.find((account) => account.refreshToken === 'r3'),
+      ).toMatchObject({
+        label: 'second snapshot',
+        rateLimitResetTimes: { claude: 333 },
+      })
+    })
+  }
+
+  it('accepts a later successful save after an earlier admitted save fails', async () => {
+    const memory = createStore(stored)
+    let releaseFirst!: () => void
+    let firstStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      releaseFirst = resolve
+    })
+    let saves = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, next) => {
+          saves++
+          if (saves === 1) {
+            firstStarted()
+            await gate
+            throw new Error('ELOCKED')
+          }
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          return next
+        },
+      },
+    })
+    const first = manager.saveToDisk()
+    await started
+    manager.getAccounts()[0]!.label = 'later intent'
+    const second = manager.saveToDisk()
+    const fence = manager.flushAndStopSaving()
+    releaseFirst()
+    const results = await Promise.allSettled([first, second, fence])
+    expect(results.map((result) => result.status)).toEqual([
+      'rejected',
+      'fulfilled',
+      'fulfilled',
+    ])
+    expect(memory.state()?.accounts[0]?.label).toBe('later intent')
   })
 
   it('stops stale deferred saves before an external pool mutation', async () => {

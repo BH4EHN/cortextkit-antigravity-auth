@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto'
+import { isDeepStrictEqual } from 'node:util'
 import type { AccountStorageStore } from './account-storage.ts'
-import { AccountStorageLockContentionError } from './account-storage.ts'
+import {
+  AccountStorageLockContentionError,
+  mergeAccountStorage,
+} from './account-storage.ts'
 import type {
   AccountMetadataV3,
   AccountSelectionStrategy,
@@ -46,6 +50,28 @@ function isStorageLockContention(error: unknown): boolean {
     message.includes('Lock file is already being held') ||
     message.includes('ELOCKED')
   )
+}
+
+function sameStoredState(
+  left: AccountStorageV4 | null,
+  right: AccountStorageV4 | null,
+): boolean {
+  // Storage writes JSON, which omits undefined optional fields. Compare
+  // durable representations while ignoring object key insertion order.
+  return isDeepStrictEqual(
+    JSON.parse(JSON.stringify(left)),
+    JSON.parse(JSON.stringify(right)),
+  )
+}
+
+export class AccountManagerPersistenceError extends Error {
+  constructor(
+    readonly state: 'retryable' | 'unconfirmed',
+    readonly originalError: unknown,
+  ) {
+    super(`Account manager persistence ${state}`)
+    this.name = 'AccountManagerPersistenceError'
+  }
 }
 
 export interface AccountManagerOptions {
@@ -353,6 +379,21 @@ export class AccountManager {
   private saveFailure: unknown = null
   private disposed = false
   private persistenceStopped = false
+  private storageAdmission: 'open' | 'fencing' | 'stopped' = 'open'
+  private fenceInFlight: Promise<void> | null = null
+  private saveQueue: Promise<void> = Promise.resolve()
+  private acceptedSaves = new Set<Promise<void>>()
+  private acceptedSaveFailure: unknown = null
+  private pendingSaveIntents: Array<{
+    kind: 'merge' | 'replace'
+    snapshot: AccountStorageV4
+  }> = []
+  private failedSaveAttempt: {
+    kind: 'merge' | 'replace'
+    baseline: AccountStorageV4 | null | undefined
+    snapshot: AccountStorageV4
+    error: unknown
+  } | null = null
   private savePromiseResolvers: Array<{
     resolve: () => void
     reject: (err: unknown) => void
@@ -1730,18 +1771,8 @@ export class AccountManager {
   }
 
   async saveToDisk(): Promise<void> {
-    if (this.persistenceStopped)
-      throw new Error('Account manager persistence has stopped')
-    const save = this.store.saveMerged(
-      this.storagePath,
-      this.buildStorageSnapshot(),
-    )
-    this.directSaves.add(save)
-    try {
-      await save
-    } finally {
-      this.directSaves.delete(save)
-    }
+    this.assertSaveAdmission()
+    await this.enqueueSave('merge')
   }
 
   /**
@@ -1750,25 +1781,206 @@ export class AccountManager {
    * mergeAccountStorage re-reading it from disk.
    */
   async saveToDiskReplace(): Promise<void> {
-    if (this.persistenceStopped)
+    this.assertSaveAdmission()
+    await this.enqueueSave('replace')
+  }
+
+  private assertSaveAdmission(): void {
+    if (this.storageAdmission !== 'open' || this.persistenceStopped) {
       throw new Error('Account manager persistence has stopped')
-    const snapshot = this.buildStorageSnapshot()
-    const save = this.store
-      .mutate(this.storagePath, () => snapshot)
-      .then(() => {})
-    this.directSaves.add(save)
-    try {
-      await save
-    } finally {
-      this.directSaves.delete(save)
     }
   }
 
-  requestSaveToDisk(): void {
-    if (this.disposed || this.savePending) {
-      return
+  private enqueueSave(kind: 'merge' | 'replace'): Promise<void> {
+    const intent = {
+      kind,
+      snapshot: structuredClone(this.buildStorageSnapshot()),
     }
-    this.savePending = true
+    const save = this.saveQueue.then(async () => {
+      // Retain this intent before reconciling older work: reconciliation
+      // can fail without ever attempting this new snapshot. Capture happened
+      // at invocation time, while queue insertion stays in serial order.
+      this.pendingSaveIntents.push(intent)
+      await this.drainSaveIntents()
+    })
+    this.acceptedSaves.add(save)
+    this.directSaves.add(save)
+    void save.then(
+      () => {
+        this.acceptedSaveFailure = null
+      },
+      (error) => {
+        this.acceptedSaveFailure = error
+      },
+    )
+    void save
+      .finally(() => {
+        this.acceptedSaves.delete(save)
+        this.directSaves.delete(save)
+      })
+      .catch(() => {})
+    this.saveQueue = save.then(
+      () => {},
+      () => {},
+    )
+    return save
+  }
+
+  private async drainSaveIntents(
+    recoveredBaseline?: AccountStorageV4,
+  ): Promise<void> {
+    let guardedBaseline = recoveredBaseline
+    const failed = this.failedSaveAttempt
+    if (failed) {
+      const result = await this.readBackFailedSave()
+      if (result === 'missing') {
+        guardedBaseline = await this.retryFailedSave()
+      } else if (result === 'saved') {
+        guardedBaseline =
+          failed.kind === 'merge'
+            ? mergeAccountStorage(
+                failed.baseline ?? { version: 4, accounts: [], activeIndex: 0 },
+                failed.snapshot,
+              )
+            : failed.snapshot
+      }
+    }
+    while (this.pendingSaveIntents.length > 0) {
+      const intent = this.pendingSaveIntents[0]!
+      const { kind, snapshot } = intent
+      let baseline: AccountStorageV4 | null | undefined = guardedBaseline
+      if (baseline === undefined) {
+        // Preserve ordinary saves when baseline reads are unavailable.
+        try {
+          baseline = structuredClone(await this.store.load(this.storagePath))
+        } catch (error) {
+          this.onDiagnostic?.('Could not capture account-state baseline', {
+            error: String(error),
+          })
+        }
+      }
+      try {
+        let saved: AccountStorageV4
+        if (guardedBaseline !== undefined) {
+          const expected = guardedBaseline
+          saved = await this.store.mutate(this.storagePath, (current) => {
+            if (!sameStoredState(current, expected)) {
+              throw new AccountManagerPersistenceError(
+                'unconfirmed',
+                new Error('Account state changed before a deferred save'),
+              )
+            }
+            return kind === 'merge'
+              ? mergeAccountStorage(current, snapshot)
+              : snapshot
+          })
+        } else if (kind === 'merge') {
+          saved = await this.store.saveMerged(this.storagePath, snapshot)
+        } else {
+          saved = await this.store.mutate(this.storagePath, (current) => {
+            baseline = structuredClone(current)
+            return snapshot
+          })
+        }
+        this.pendingSaveIntents.shift()
+        // Further retained intents must not overwrite changes made between
+        // recovery and their lock-held write.
+        guardedBaseline = structuredClone(saved)
+        this.acceptedSaveFailure = null
+      } catch (error) {
+        this.pendingSaveIntents.shift()
+        this.failedSaveAttempt = { kind, baseline, snapshot, error }
+        throw error
+      }
+    }
+  }
+
+  private async readBackFailedSave(): Promise<'none' | 'saved' | 'missing'> {
+    const attempt = this.failedSaveAttempt
+    if (!attempt) return 'none'
+    if (isStorageLockContention(attempt.error)) {
+      return 'missing'
+    }
+    let current: AccountStorageV4 | null
+    try {
+      current = await this.store.load(this.storagePath)
+    } catch (error) {
+      throw new AccountManagerPersistenceError('unconfirmed', error)
+    }
+    if (attempt.baseline === undefined) {
+      throw new AccountManagerPersistenceError('unconfirmed', attempt.error)
+    }
+    const expected =
+      attempt.kind === 'merge'
+        ? mergeAccountStorage(
+            attempt.baseline ?? { version: 4, accounts: [], activeIndex: 0 },
+            attempt.snapshot,
+          )
+        : attempt.snapshot
+    if (sameStoredState(current, expected)) {
+      this.failedSaveAttempt = null
+      this.acceptedSaveFailure = null
+      return 'saved'
+    }
+    if (sameStoredState(current, attempt.baseline)) {
+      return 'missing'
+    }
+    throw new AccountManagerPersistenceError('unconfirmed', attempt.error)
+  }
+
+  /** Retry only the exact failed intent under a lock-held state check. */
+  private async retryFailedSave(): Promise<AccountStorageV4 | undefined> {
+    const attempt = this.failedSaveAttempt
+    if (!attempt) return
+    if (attempt.baseline === undefined) {
+      throw new AccountManagerPersistenceError('unconfirmed', attempt.error)
+    }
+    const baseline = attempt.baseline
+    try {
+      const saved = await this.store.mutate(this.storagePath, (current) => {
+        if (
+          !sameStoredState(
+            current,
+            baseline ?? { version: 4, accounts: [], activeIndex: 0 },
+          )
+        ) {
+          throw new AccountManagerPersistenceError('unconfirmed', attempt.error)
+        }
+        return attempt.kind === 'merge'
+          ? mergeAccountStorage(current, attempt.snapshot)
+          : attempt.snapshot
+      })
+      this.failedSaveAttempt = null
+      this.saveFailure = null
+      this.acceptedSaveFailure = null
+      return structuredClone(saved)
+    } catch (error) {
+      if (error instanceof AccountManagerPersistenceError) throw error
+      attempt.error = error
+      throw error
+    }
+  }
+
+  private enqueueFailedSaveReconciliation(
+    recoveredBaseline?: AccountStorageV4,
+  ): Promise<void> {
+    const reconcile = this.saveQueue.then(() =>
+      this.drainSaveIntents(recoveredBaseline),
+    )
+    this.saveQueue = reconcile.then(
+      () => {},
+      () => {},
+    )
+    return reconcile
+  }
+
+  private schedulePendingSave(): void {
+    if (
+      !this.savePending ||
+      this.saveTimeout ||
+      this.storageAdmission !== 'open'
+    )
+      return
     this.saveTimeout = setTimeout(() => {
       this.saveInFlight = this.executeSave().finally(() => {
         this.saveInFlight = null
@@ -1776,10 +1988,19 @@ export class AccountManager {
     }, 1000)
   }
 
+  requestSaveToDisk(): void {
+    if (this.disposed || this.persistenceStopped) {
+      return
+    }
+    this.savePending = true
+    this.schedulePendingSave()
+  }
+
   async flushSaveToDisk(options: { strict?: boolean } = {}): Promise<void> {
-    if (this.persistenceStopped) {
+    if (this.storageAdmission !== 'open' || this.persistenceStopped) {
       throw new Error('Account manager persistence has stopped')
     }
+    this.schedulePendingSave()
     if (!this.savePending) {
       await this.saveInFlight
       if (this.saveFailure && options.strict) throw this.saveFailure
@@ -1792,6 +2013,112 @@ export class AccountManager {
         strict: options.strict === true,
       })
     })
+  }
+
+  /** Close admission now, then confirm accepted writes before retiring. */
+  flushAndStopSaving(): Promise<void> {
+    if (this.fenceInFlight) return this.fenceInFlight
+    if (this.storageAdmission === 'stopped' || this.persistenceStopped) {
+      return Promise.reject(
+        new Error('Account manager persistence has stopped'),
+      )
+    }
+    this.storageAdmission = 'fencing'
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout)
+      this.saveTimeout = null
+    }
+    const fence = this.finishFlushAndStopSaving()
+    this.fenceInFlight = fence
+    void fence
+      .finally(() => {
+        this.fenceInFlight = null
+      })
+      .catch(() => {})
+    return fence
+  }
+
+  private async finishFlushAndStopSaving(): Promise<void> {
+    try {
+      const hasAcceptedWork =
+        this.acceptedSaves.size > 0 ||
+        this.saveInFlight !== null ||
+        this.savePending
+      if (
+        !hasAcceptedWork &&
+        (this.failedSaveAttempt || this.pendingSaveIntents.length > 0)
+      ) {
+        await this.enqueueFailedSaveReconciliation()
+      }
+      while (true) {
+        if (this.saveTimeout) {
+          clearTimeout(this.saveTimeout)
+          this.saveTimeout = null
+        }
+        if (this.savePending) {
+          this.saveInFlight = this.executeSave().finally(() => {
+            this.saveInFlight = null
+          })
+        }
+        await this.saveQueue
+        await this.saveInFlight
+        const failed = this.failedSaveAttempt
+        const readBack = await this.readBackFailedSave()
+        if (
+          readBack === 'saved' &&
+          failed &&
+          this.pendingSaveIntents.length > 0
+        ) {
+          const recovered =
+            failed.kind === 'merge'
+              ? mergeAccountStorage(
+                  failed.baseline ?? {
+                    version: 4,
+                    accounts: [],
+                    activeIndex: 0,
+                  },
+                  failed.snapshot,
+                )
+              : failed.snapshot
+          await this.enqueueFailedSaveReconciliation(recovered)
+          continue
+        }
+        if (readBack === 'missing') {
+          throw new AccountManagerPersistenceError(
+            'retryable',
+            this.failedSaveAttempt?.error ?? this.acceptedSaveFailure,
+          )
+        }
+        if (readBack === 'none' && this.acceptedSaveFailure) {
+          if (
+            this.acceptedSaveFailure instanceof AccountManagerPersistenceError
+          ) {
+            throw this.acceptedSaveFailure
+          }
+          throw new AccountManagerPersistenceError(
+            'unconfirmed',
+            this.acceptedSaveFailure,
+          )
+        }
+        if (this.savePending) continue
+        this.storageAdmission = 'stopped'
+        this.persistenceStopped = true
+        this.disposed = true
+        return
+      }
+    } catch (error) {
+      if (error instanceof AccountManagerPersistenceError) {
+        if (error.state === 'retryable') {
+          this.storageAdmission = 'open'
+        }
+        throw error
+      }
+      if (isStorageLockContention(error)) {
+        this.storageAdmission = 'open'
+        throw new AccountManagerPersistenceError('retryable', error)
+      }
+      throw new AccountManagerPersistenceError('unconfirmed', error)
+    }
   }
 
   /**
@@ -1809,6 +2136,7 @@ export class AccountManager {
       return
     }
     this.persistenceStopped = true
+    this.storageAdmission = 'stopped'
     this.disposed = true
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout)
@@ -1845,7 +2173,8 @@ export class AccountManager {
     this.savePromiseResolvers = []
 
     try {
-      await this.saveToDisk()
+      if (this.storageAdmission === 'open') await this.saveToDisk()
+      else await this.enqueueSave('merge')
       this.saveFailure = null
       for (const { resolve } of resolvers) {
         resolve()
