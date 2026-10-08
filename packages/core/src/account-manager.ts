@@ -373,6 +373,12 @@ export class AccountManager {
   private lastToastTime = 0
 
   private savePending = false
+  private saveRequestVersion = 0
+  private recoveryConfirmedVersion = 0
+  private failedRecoverySnapshot: {
+    snapshot: AccountStorageV4
+    requestVersion: number
+  } | null = null
   private saveTimeout: ReturnType<typeof setTimeout> | null = null
   private saveInFlight: Promise<void> | null = null
   private directSaves = new Set<Promise<unknown>>()
@@ -382,6 +388,10 @@ export class AccountManager {
   private persistenceStopped = false
   private storageAdmission: 'open' | 'fencing' | 'stopped' = 'open'
   private fenceInFlight: Promise<void> | null = null
+  private failedFenceUnconfirmed = false
+  private savingRecoveryEnabled = false
+  private savingRecoveryGeneration = 0
+  private savingRecoveryInFlight: Promise<void> | null = null
   private saveQueue: Promise<void> = Promise.resolve()
   private acceptedSaves = new Set<Promise<void>>()
   private acceptedSaveFailure: unknown = null
@@ -1829,11 +1839,13 @@ export class AccountManager {
 
   private async drainSaveIntents(
     recoveredBaseline?: AccountStorageV4,
-  ): Promise<void> {
+    assertActive?: () => void,
+  ): Promise<AccountStorageV4 | undefined> {
     let guardedBaseline = recoveredBaseline
     const failed = this.failedSaveAttempt
     if (failed) {
       const result = await this.readBackFailedSave()
+      assertActive?.()
       if (result === 'missing') {
         guardedBaseline = await this.retryFailedSave()
       } else if (result === 'saved') {
@@ -1847,6 +1859,7 @@ export class AccountManager {
       }
     }
     while (this.pendingSaveIntents.length > 0) {
+      assertActive?.()
       const intent = this.pendingSaveIntents[0]!
       const { kind, snapshot } = intent
       let baseline: AccountStorageV4 | null | undefined = guardedBaseline
@@ -1860,6 +1873,7 @@ export class AccountManager {
           })
         }
       }
+      assertActive?.()
       try {
         let saved: AccountStorageV4
         if (guardedBaseline !== undefined) {
@@ -1894,6 +1908,7 @@ export class AccountManager {
         throw error
       }
     }
+    return guardedBaseline
   }
 
   private async readBackFailedSave(): Promise<'none' | 'saved' | 'missing'> {
@@ -1965,9 +1980,9 @@ export class AccountManager {
   private enqueueFailedSaveReconciliation(
     recoveredBaseline?: AccountStorageV4,
   ): Promise<void> {
-    const reconcile = this.saveQueue.then(() =>
-      this.drainSaveIntents(recoveredBaseline),
-    )
+    const reconcile = this.saveQueue.then(async () => {
+      await this.drainSaveIntents(recoveredBaseline)
+    })
     this.saveQueue = reconcile.then(
       () => {},
       () => {},
@@ -1979,14 +1994,170 @@ export class AccountManager {
     if (
       !this.savePending ||
       this.saveTimeout ||
-      this.storageAdmission !== 'open'
+      (this.storageAdmission !== 'open' &&
+        !(this.storageAdmission === 'fencing' && this.savingRecoveryEnabled)) ||
+      this.savingRecoveryInFlight
     )
       return
     this.saveTimeout = setTimeout(() => {
+      if (this.storageAdmission === 'fencing' && this.savingRecoveryEnabled) {
+        this.saveTimeout = null
+        void this.startSavingRecovery().catch(() => {})
+        return
+      }
       this.saveInFlight = this.executeSave().finally(() => {
         this.saveInFlight = null
       })
     }, 1000)
+  }
+
+  /** Permit a live failed fence to reconcile on its next save request. */
+  enableSavingRecovery(): void {
+    if (
+      this.storageAdmission !== 'fencing' ||
+      !this.failedFenceUnconfirmed ||
+      this.persistenceStopped ||
+      this.disposed
+    )
+      return
+    this.savingRecoveryEnabled = true
+  }
+
+  private invalidateSavingRecovery(): void {
+    this.savingRecoveryGeneration++
+    this.savingRecoveryEnabled = false
+  }
+
+  private discardFailedFenceForDispose(): void {
+    if (
+      !this.disposed ||
+      this.storageAdmission !== 'fencing' ||
+      !this.failedFenceUnconfirmed
+    )
+      return
+    this.invalidateSavingRecovery()
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout)
+      this.saveTimeout = null
+    }
+    this.savePending = false
+    const resolvers = this.savePromiseResolvers
+    this.savePromiseResolvers = []
+    for (const { reject } of resolvers) {
+      reject(new Error('Account manager persistence has stopped'))
+    }
+  }
+
+  private assertSavingRecovery(generation: number): void {
+    if (
+      generation !== this.savingRecoveryGeneration ||
+      !this.savingRecoveryEnabled ||
+      this.storageAdmission !== 'fencing' ||
+      this.persistenceStopped ||
+      this.disposed
+    ) {
+      throw new Error('Account manager persistence has stopped')
+    }
+  }
+
+  private startSavingRecovery(): Promise<void> {
+    if (this.savingRecoveryInFlight) return this.savingRecoveryInFlight
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout)
+      this.saveTimeout = null
+    }
+    const generation = this.savingRecoveryGeneration
+    const recovery = this.saveQueue.then(async () => {
+      this.assertSavingRecovery(generation)
+      // Resolve the exact accepted failure and every retained intent before
+      // considering memory that changed while admission was fenced.
+      const failedAttempt = this.failedSaveAttempt
+      const baseline = await this.drainSaveIntents(undefined, () =>
+        this.assertSavingRecovery(generation),
+      )
+      this.assertSavingRecovery(generation)
+      if (
+        this.failedRecoverySnapshot &&
+        failedAttempt?.snapshot === this.failedRecoverySnapshot.snapshot &&
+        !this.failedSaveAttempt
+      ) {
+        if (
+          this.saveRequestVersion === this.failedRecoverySnapshot.requestVersion
+        ) {
+          this.savePending = false
+        }
+        this.failedRecoverySnapshot = null
+      }
+      if (baseline === undefined) {
+        throw new AccountManagerPersistenceError(
+          'unconfirmed',
+          this.acceptedSaveFailure,
+        )
+      }
+      if (this.savePending) {
+        const snapshot = structuredClone(this.buildStorageSnapshot())
+        const capturedVersion = this.saveRequestVersion
+        this.savePending = false
+        try {
+          await this.store.mutate(this.storagePath, (current) => {
+            if (!sameStoredState(current, baseline)) {
+              throw new AccountManagerPersistenceError(
+                'unconfirmed',
+                new Error('Account state changed before a recovery save'),
+              )
+            }
+            return mergeAccountStorage(current, snapshot)
+          })
+        } catch (error) {
+          this.failedSaveAttempt = {
+            kind: 'merge',
+            baseline,
+            snapshot,
+            error,
+          }
+          this.savePending = true
+          this.failedRecoverySnapshot = {
+            snapshot,
+            requestVersion: capturedVersion,
+          }
+          throw error
+        }
+        this.assertSavingRecovery(generation)
+        this.recoveryConfirmedVersion = capturedVersion
+      } else {
+        this.recoveryConfirmedVersion = this.saveRequestVersion
+      }
+      this.assertSavingRecovery(generation)
+      this.storageAdmission = 'open'
+      this.savingRecoveryEnabled = false
+      this.failedFenceUnconfirmed = false
+      this.saveFailure = null
+      this.acceptedSaveFailure = null
+    })
+    this.saveQueue = recovery.then(
+      () => {},
+      () => {},
+    )
+    this.savingRecoveryInFlight = recovery
+    let succeeded = false
+    void recovery
+      .then(
+        () => {
+          succeeded = true
+        },
+        (error) => {
+          this.saveFailure = error
+        },
+      )
+      .finally(() => {
+        if (this.savingRecoveryInFlight === recovery) {
+          this.savingRecoveryInFlight = null
+        }
+        if (succeeded && this.storageAdmission === 'open' && !this.disposed) {
+          this.schedulePendingSave()
+        }
+      })
+    return recovery
   }
 
   requestSaveToDisk(): void {
@@ -1994,10 +2165,19 @@ export class AccountManager {
       return
     }
     this.savePending = true
+    this.saveRequestVersion++
     this.schedulePendingSave()
   }
 
   async flushSaveToDisk(options: { strict?: boolean } = {}): Promise<void> {
+    if (this.storageAdmission === 'fencing' && this.savingRecoveryEnabled) {
+      const requestedVersion = this.saveRequestVersion
+      await this.startSavingRecovery()
+      if (requestedVersion > this.recoveryConfirmedVersion) {
+        await this.flushSaveToDisk({ strict: true })
+      }
+      return
+    }
     if (this.storageAdmission !== 'open' || this.persistenceStopped) {
       throw new Error('Account manager persistence has stopped')
     }
@@ -2024,6 +2204,8 @@ export class AccountManager {
         new Error('Account manager persistence has stopped'),
       )
     }
+    this.invalidateSavingRecovery()
+    this.failedFenceUnconfirmed = false
     this.storageAdmission = 'fencing'
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout)
@@ -2105,12 +2287,15 @@ export class AccountManager {
         this.storageAdmission = 'stopped'
         this.persistenceStopped = true
         this.disposed = true
+        this.failedFenceUnconfirmed = false
         return
       }
     } catch (error) {
       if (error instanceof AccountManagerPersistenceError) {
         if (error.state === 'retryable') {
           this.storageAdmission = 'open'
+        } else {
+          this.failedFenceUnconfirmed = true
         }
         throw error
       }
@@ -2118,6 +2303,7 @@ export class AccountManager {
         this.storageAdmission = 'open'
         throw new AccountManagerPersistenceError('retryable', error)
       }
+      this.failedFenceUnconfirmed = true
       throw new AccountManagerPersistenceError('unconfirmed', error)
     }
   }
@@ -2129,8 +2315,11 @@ export class AccountManager {
    * before starting the mutation.
    */
   async stopSaving(): Promise<void> {
+    this.invalidateSavingRecovery()
     if (this.persistenceStopped) {
       await this.saveInFlight
+      await this.savingRecoveryInFlight?.catch(() => {})
+      this.savePending = false
       await Promise.all(
         [...this.directSaves].map((save) => save.catch(() => {})),
       )
@@ -2150,12 +2339,15 @@ export class AccountManager {
       reject(new Error('Account manager persistence has stopped'))
     }
     await this.saveInFlight
+    await this.savingRecoveryInFlight?.catch(() => {})
+    this.savePending = false
     await Promise.all([...this.directSaves].map((save) => save.catch(() => {})))
   }
 
   dispose(): Promise<void> {
     if (this.disposeInFlight) return this.disposeInFlight
     this.disposed = true
+    this.discardFailedFenceForDispose()
     const disposing = this.finishDispose()
     this.disposeInFlight = disposing
     void disposing
@@ -2168,11 +2360,16 @@ export class AccountManager {
 
   private async finishDispose(): Promise<void> {
     while (true) {
+      this.discardFailedFenceForDispose()
       if (this.saveTimeout) {
         clearTimeout(this.saveTimeout)
         this.saveTimeout = null
       }
-      if (this.savePending && !this.saveInFlight) {
+      if (
+        this.savePending &&
+        !this.saveInFlight &&
+        this.storageAdmission === 'open'
+      ) {
         this.saveInFlight = this.executeSave().finally(() => {
           this.saveInFlight = null
         })
@@ -2184,19 +2381,24 @@ export class AccountManager {
       const inFlight = this.saveInFlight
       const saveQueue = this.saveQueue
       const fenceInFlight = this.fenceInFlight?.catch(() => {})
+      const recoveryInFlight = this.savingRecoveryInFlight?.catch(() => {})
       await Promise.all([
         ...directSaves,
         ...(inFlight ? [inFlight] : []),
         saveQueue,
         ...(fenceInFlight ? [fenceInFlight] : []),
+        ...(recoveryInFlight ? [recoveryInFlight] : []),
       ])
+
+      this.discardFailedFenceForDispose()
 
       if (
         !this.savePending &&
         !this.saveInFlight &&
         this.directSaves.size === 0 &&
         this.saveQueue === saveQueue &&
-        !this.fenceInFlight
+        !this.fenceInFlight &&
+        !this.savingRecoveryInFlight
       ) {
         return
       }

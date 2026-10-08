@@ -750,6 +750,7 @@ export function createOpenCodeV2AntigravityPlugin(
             await previous.flushAndStopSaving()
           } catch (error) {
             log('pool-save-fence-error', errorMessage(error))
+            previous.enableSavingRecovery()
             finishTransition?.()
             finishTransition = null
             transition = null

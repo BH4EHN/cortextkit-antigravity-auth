@@ -513,6 +513,171 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
     }
   })
 
+  for (const failedWrite of ['missing', 'already-committed'] as const) {
+    test(`recovers a failed OAuth fence on the next successful request when storage becomes readable (${failedWrite})`, async () => {
+      const path = seedPool([
+        {
+          email: 'a@example.test',
+          refreshToken: 'old-a',
+          addedAt: 1,
+          lastUsed: 1,
+          enabled: true,
+        },
+        {
+          email: 'b@example.test',
+          refreshToken: 'token-b',
+          addedAt: 2,
+          lastUsed: 2,
+          enabled: true,
+        },
+      ])
+      let oauthMutations = 0
+      let storeLoadCalls = 0
+      let unreadableLoadCalls = 0
+      let saveCalls = 0
+      let recoveryMutations = 0
+      let storageReadable = true
+      const persisted = deferred<void>()
+      const sent: string[] = []
+      const captured = await setupPoolAdapter({
+        authorizeAntigravity: async () => ({
+          url: 'https://accounts.example/authorize?state=pool-state',
+          verifier: 'verifier',
+          projectId: '',
+        }),
+        waitForAntigravityCode: async () => 'code',
+        exchangeAntigravity: async () => ({
+          type: 'success',
+          refresh: 'new-a',
+          access: 'access',
+          expires: Date.now() + 600_000,
+          email: 'a@example.test',
+          projectId: 'project',
+        }),
+        mutateAccountStorage: async (file, mutator) => {
+          oauthMutations++
+          return mutateAccountStorage(file, mutator)
+        },
+        refreshAntigravityToken: async (refresh) => ({
+          refresh,
+          access: refresh,
+          expires: Date.now() + 600_000,
+        }),
+        ensureProjectContext: async (auth) => ({
+          auth,
+          projectId: 'project',
+          effectiveProjectId: 'project',
+        }),
+        send: async ({ auth }) => {
+          sent.push(auth.access ?? '')
+          return sent.length === 1
+            ? new Response(JSON.stringify({ error: { message: 'limited' } }), {
+                status: 429,
+                headers: { 'retry-after': '120' },
+              })
+            : successResponse()
+        },
+      })
+      const storeLoad = spyOn(
+        defaultAccountStorageStore,
+        'load',
+      ).mockImplementation(async (file) => {
+        storeLoadCalls++
+        if (!storageReadable) {
+          unreadableLoadCalls++
+          throw new Error('temporary account state readback failure')
+        }
+        return loadAccountStorage(file)
+      })
+      const save = spyOn(
+        defaultAccountStorageStore,
+        'saveMerged',
+      ).mockImplementation(async (file, next) => {
+        saveCalls++
+        if (saveCalls === 1) {
+          if (failedWrite === 'already-committed')
+            await saveAccountStorage(file, next)
+          storageReadable = false
+          throw new Error('account state save result unknown')
+        }
+        return saveAccountStorage(file, next)
+      })
+      const storeMutate = spyOn(
+        defaultAccountStorageStore,
+        'mutate',
+      ).mockImplementation(async (file, mutator, options) => {
+        const result = await mutateAccountStorage(file, mutator, options)
+        recoveryMutations++
+        persisted.resolve()
+        return result
+      })
+      try {
+        expect((await titleRequest(captured.hook)).ok).toBe(true)
+        expect(sent).toEqual(['old-a', 'token-b'])
+        const callback = (await captured.oauth.authorize()).callback
+        let fenceError: unknown
+        try {
+          await callback
+        } catch (error) {
+          fenceError = error
+        }
+        expect(fenceError).toBeInstanceOf(AccountManagerPersistenceError)
+        expect(fenceError).toMatchObject({
+          state: 'unconfirmed',
+          originalError: expect.objectContaining({
+            message: 'temporary account state readback failure',
+          }),
+        })
+        expect(oauthMutations).toBe(0)
+        expect(unreadableLoadCalls).toBeGreaterThan(0)
+        expect(readPool(path).accounts[1]?.enabled).toBe(true)
+        if (failedWrite === 'missing')
+          expect(
+            readPool(path).accounts[0]?.rateLimitResetTimes,
+          ).toBeUndefined()
+        else
+          expect(
+            Object.values(
+              readPool(path).accounts[0]?.rateLimitResetTimes ?? {},
+            ).some((resetAt) => typeof resetAt === 'number'),
+          ).toBe(true)
+
+        const idleLoadCount = storeLoadCalls
+        const idleSaveCount = saveCalls
+        await Bun.sleep(1050)
+        expect(storeLoadCalls).toBe(idleLoadCount)
+        expect(saveCalls).toBe(idleSaveCount)
+
+        storageReadable = true
+        expect((await titleRequest(captured.hook)).ok).toBe(true)
+        expect(sent.slice(-1)).toEqual(['token-b'])
+        await Promise.race([
+          persisted.promise,
+          Bun.sleep(3000).then(() => {
+            throw new Error('successful request did not recover account state')
+          }),
+        ])
+        await Bun.sleep(10)
+        expect(oauthMutations).toBe(0)
+        if (failedWrite === 'already-committed')
+          expect(recoveryMutations).toBe(1)
+        else expect(recoveryMutations).toBeGreaterThan(0)
+        const recovered = readPool(path)
+        expect(
+          Object.values(recovered.accounts[0]?.rateLimitResetTimes ?? {}).some(
+            (resetAt) => typeof resetAt === 'number',
+          ),
+        ).toBe(true)
+        expect(recovered.accounts[1]?.lastUsed).toBeGreaterThan(2)
+      } finally {
+        storeLoad.mockRestore()
+        save.mockRestore()
+        storeMutate.mockRestore()
+        await captured.cleanup()
+      }
+    })
+  }
+
   test('reconciles a write-then-error without replaying OAuth mutation', async () => {
     const path = seedPool([
       {

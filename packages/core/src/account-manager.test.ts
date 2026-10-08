@@ -778,6 +778,707 @@ describe('core AccountManager', () => {
     expect(calls).toBe(1)
   })
 
+  it('recovers a failed fence only after explicit enablement and a new flush', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let reads = 0
+    let writes = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (reads > 1 && !readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async (path, next) => {
+          writes++
+          await memory.store.mutate(path, (current) =>
+            mergeAccountStorage(current, next),
+          )
+          if (writes === 1) throw new Error('response lost')
+          return next
+        },
+      },
+    })
+    manager.getAccounts()[0]!.label = 'accepted'
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(writes).toBe(1)
+    const enable = Reflect.get(manager, 'enableSavingRecovery')
+    expect(typeof enable).toBe('function')
+    if (typeof enable !== 'function') return
+    Reflect.apply(enable, manager, [])
+    readable = true
+    manager.getAccounts()[0]!.label = 'latest'
+    manager.requestSaveToDisk()
+    await manager.flushSaveToDisk({ strict: true })
+    expect(writes).toBe(1)
+    expect(memory.state()?.accounts[0]?.label).toBe('latest')
+    await manager.saveToDisk()
+  })
+
+  it('does not enable recovery while the first fence is still in progress', async () => {
+    const memory = createStore(stored)
+    let releaseWrite!: () => void
+    let markWriteStarted!: () => void
+    const writeStarted = new Promise<void>((resolve) => {
+      markWriteStarted = resolve
+    })
+    let reads = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (reads > 1) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          markWriteStarted()
+          await new Promise<void>((resolve) => {
+            releaseWrite = resolve
+          })
+          throw new Error('write lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    const fence = manager.flushAndStopSaving()
+    await writeStarted
+    manager.enableSavingRecovery()
+    releaseWrite()
+    await expect(fence).rejects.toMatchObject({ state: 'unconfirmed' })
+    await expect(manager.flushSaveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    await manager.dispose()
+  })
+
+  it('retries a missing accepted intent under a guarded baseline, then flushes without dirty memory', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let reads = 0
+    let writes = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (reads > 1 && !readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          writes++
+          throw new Error('write lost')
+        },
+      },
+    })
+    manager.getAccounts()[0]!.label = 'accepted'
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    readable = true
+    await manager.flushSaveToDisk({ strict: true })
+    expect(writes).toBe(1)
+    expect(memory.mutations()).toBe(1)
+    expect(memory.state()?.accounts[0]?.label).toBe('accepted')
+  })
+
+  it('starts enabled recovery from a requested save after the debounce', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      let readable = false
+      let reads = 0
+      let writes = 0
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          load: async (path) => {
+            reads++
+            if (reads > 1 && !readable) throw new Error('read unavailable')
+            return memory.store.load(path)
+          },
+          saveMerged: async (path, snapshot) => {
+            writes++
+            if (writes === 1) throw new Error('write lost')
+            return memory.store.saveMerged(path, snapshot)
+          },
+        },
+      })
+      manager.requestSaveToDisk()
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      manager.enableSavingRecovery()
+      readable = true
+      manager.getAccounts()[0]!.label = 'latest'
+      manager.requestSaveToDisk()
+      await jest.advanceTimersByTime(1000)
+      await manager.saveToDisk()
+      expect(memory.state()?.accounts[0]?.label).toBe('latest')
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('keeps a conflicting or unavailable failed baseline fenced without overwrite', async () => {
+    for (const changed of [false, true]) {
+      const memory = createStore(stored)
+      let readable = false
+      let reads = 0
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          load: async (path) => {
+            reads++
+            if (reads > 1 && !readable) throw new Error('read unavailable')
+            return memory.store.load(path)
+          },
+          saveMerged: async () => {
+            throw new Error('write lost')
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'accepted'
+      manager.requestSaveToDisk()
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      manager.enableSavingRecovery()
+      if (changed) {
+        await memory.store.mutate('', (current) => ({
+          ...current,
+          accounts: current.accounts.map((account, index) =>
+            index === 0 ? { ...account, label: 'external' } : account,
+          ),
+        }))
+        readable = true
+      }
+      const before = memory.state()
+      await expect(manager.flushSaveToDisk()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      expect(memory.state()).toEqual(before)
+      await expect(manager.saveToDisk()).rejects.toThrow(
+        'persistence has stopped',
+      )
+      await manager.dispose()
+    }
+  })
+
+  it('does not replay a failed intent when its original baseline was unreadable', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let writes = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          if (!readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          writes++
+          throw new Error('write lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    readable = true
+    await expect(manager.flushSaveToDisk()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    expect(writes).toBe(1)
+    expect(memory.mutations()).toBe(0)
+    await manager.dispose()
+  })
+
+  it('keeps repeated unreadable requests single-flight and waits for an explicit retry', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      let readable = false
+      let reads = 0
+      let writes = 0
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          load: async (path) => {
+            reads++
+            if (reads > 1 && !readable) throw new Error('read unavailable')
+            return memory.store.load(path)
+          },
+          saveMerged: async () => {
+            writes++
+            throw new Error('write lost')
+          },
+        },
+      })
+      manager.requestSaveToDisk()
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      manager.enableSavingRecovery()
+      for (let index = 0; index < 20; index++) manager.requestSaveToDisk()
+      const first = manager.flushSaveToDisk()
+      const second = manager.flushSaveToDisk()
+      const failures = await Promise.allSettled([first, second])
+      expect(failures.map((result) => result.status)).toEqual([
+        'rejected',
+        'rejected',
+      ])
+      const readsAfterFailure = reads
+      await jest.advanceTimersByTime(5000)
+      expect(reads).toBe(readsAfterFailure)
+      expect(writes).toBe(1)
+      readable = true
+      await manager.flushSaveToDisk()
+      expect(memory.state()?.accounts).toHaveLength(2)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('keeps changes made during the recovery write for the next ordinary save', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      let readable = false
+      let reads = 0
+      let releaseWrite!: () => void
+      let markWriteStarted!: () => void
+      const writeStarted = new Promise<void>((resolve) => {
+        markWriteStarted = resolve
+      })
+      let blockRecoveryWrite = false
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          load: async (path) => {
+            reads++
+            if (reads > 1 && !readable) throw new Error('read unavailable')
+            return memory.store.load(path)
+          },
+          saveMerged: async (path, next) => {
+            await memory.store.mutate(path, (current) =>
+              mergeAccountStorage(current, next),
+            )
+            throw new Error('response lost')
+          },
+          mutate: async (path, fn) => {
+            if (blockRecoveryWrite) {
+              blockRecoveryWrite = false
+              markWriteStarted()
+              await new Promise<void>((resolve) => {
+                releaseWrite = resolve
+              })
+            }
+            return memory.store.mutate(path, fn)
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'accepted'
+      manager.requestSaveToDisk()
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      manager.enableSavingRecovery()
+      readable = true
+      blockRecoveryWrite = true
+      manager.getAccounts()[0]!.label = 'captured'
+      manager.requestSaveToDisk()
+      const recovery = manager.flushSaveToDisk()
+      await writeStarted
+      manager.getAccounts()[0]!.label = 'late'
+      manager.requestSaveToDisk()
+      releaseWrite()
+      await recovery
+      expect(memory.state()?.accounts[0]?.label).toBe('captured')
+      await jest.advanceTimersByTime(1000)
+      expect(memory.state()?.accounts[0]?.label).toBe('late')
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('holds a late flush until its dirty update after an active recovery write', async () => {
+    jest.useFakeTimers()
+    try {
+      const memory = createStore(stored)
+      let readable = false
+      let reads = 0
+      let releaseWrite!: () => void
+      let markWriteStarted!: () => void
+      const writeStarted = new Promise<void>((resolve) => {
+        markWriteStarted = resolve
+      })
+      let blockRecoveryWrite = false
+      let originalWrite = true
+      const manager = new AccountManager(undefined, stored, {
+        store: {
+          ...memory.store,
+          load: async (path) => {
+            reads++
+            if (reads > 1 && !readable) throw new Error('read unavailable')
+            return memory.store.load(path)
+          },
+          saveMerged: async (path, next) => {
+            if (originalWrite) {
+              originalWrite = false
+              await memory.store.mutate(path, (current) =>
+                mergeAccountStorage(current, next),
+              )
+              throw new Error('response lost')
+            }
+            return memory.store.saveMerged(path, next)
+          },
+          mutate: async (path, fn) => {
+            if (blockRecoveryWrite) {
+              blockRecoveryWrite = false
+              markWriteStarted()
+              await new Promise<void>((resolve) => {
+                releaseWrite = resolve
+              })
+            }
+            return memory.store.mutate(path, fn)
+          },
+        },
+      })
+      manager.requestSaveToDisk()
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      manager.enableSavingRecovery()
+      readable = true
+      blockRecoveryWrite = true
+      manager.getAccounts()[0]!.label = 'A'
+      manager.requestSaveToDisk()
+      const firstFlush = manager.flushSaveToDisk()
+      await writeStarted
+      manager.getAccounts()[0]!.label = 'B'
+      manager.requestSaveToDisk()
+      let lateResolved = false
+      const lateFlush = manager.flushSaveToDisk().then(() => {
+        lateResolved = true
+      })
+      releaseWrite()
+      await firstFlush
+      await Promise.resolve()
+      expect(memory.state()?.accounts[0]?.label).toBe('A')
+      expect(lateResolved).toBe(false)
+      await jest.advanceTimersByTime(1000)
+      await lateFlush
+      expect(memory.state()?.accounts[0]?.label).toBe('B')
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it.each([
+    false,
+    true,
+  ])('confirms a committed recovery write before %s later dirty update', async (lateDirty) => {
+    const memory = createStore(stored)
+    let readable = false
+    let reads = 0
+    let writes = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (reads > 1 && !readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          throw new Error('original write lost')
+        },
+        mutate: async (path, fn) => {
+          writes++
+          const saved = await memory.store.mutate(path, fn)
+          if (writes === 2) {
+            if (lateDirty) {
+              manager.getAccounts()[0]!.label = 'B'
+              manager.requestSaveToDisk()
+            }
+            throw new Error('recovery response lost')
+          }
+          return saved
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    readable = true
+    manager.getAccounts()[0]!.label = 'A'
+    manager.requestSaveToDisk()
+    await expect(manager.flushSaveToDisk()).rejects.toThrow(
+      'recovery response lost',
+    )
+    expect(memory.state()?.accounts[0]?.label).toBe('A')
+    await manager.flushSaveToDisk()
+    expect(writes).toBe(lateDirty ? 3 : 2)
+    expect(memory.state()?.accounts[0]?.label).toBe(lateDirty ? 'B' : 'A')
+  })
+
+  it('dispose preserves a late requested save accepted by an active ordinary fence', async () => {
+    const memory = createStore(stored)
+    let releaseSave!: () => void
+    let markSaveStarted!: () => void
+    const saveStarted = new Promise<void>((resolve) => {
+      markSaveStarted = resolve
+    })
+    let first = true
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path, snapshot) => {
+          if (first) {
+            first = false
+            markSaveStarted()
+            await new Promise<void>((resolve) => {
+              releaseSave = resolve
+            })
+          }
+          return memory.store.saveMerged(path, snapshot)
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    const fence = manager.flushAndStopSaving()
+    await saveStarted
+    manager.getAccounts()[0]!.label = 'late'
+    manager.requestSaveToDisk()
+    const disposing = manager.dispose()
+    releaseSave()
+    await Promise.all([fence, disposing])
+    expect(memory.state()?.accounts[0]?.label).toBe('late')
+  })
+
+  it('dispose drains a failed active fence after rejecting its late work', async () => {
+    const memory = createStore(stored)
+    let releaseSave!: () => void
+    let markSaveStarted!: () => void
+    const saveStarted = new Promise<void>((resolve) => {
+      markSaveStarted = resolve
+    })
+    let reads = 0
+    let writes = 0
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (reads > 1) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          writes++
+          markSaveStarted()
+          await new Promise<void>((resolve) => {
+            releaseSave = resolve
+          })
+          throw new Error('response lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    const initialFlush = manager
+      .flushSaveToDisk({ strict: true })
+      .catch((error: unknown) => error)
+    const fence = manager.flushAndStopSaving()
+    await saveStarted
+    manager.getAccounts()[0]!.label = 'late'
+    manager.requestSaveToDisk()
+    const lateFlush = manager.flushSaveToDisk().catch((error: unknown) => error)
+    const disposing = manager.dispose()
+    releaseSave()
+    expect(String(await initialFlush)).toContain('response lost')
+    expect(String(await lateFlush)).toContain('persistence has stopped')
+    await expect(fence).rejects.toMatchObject({ state: 'unconfirmed' })
+    const observedFailure = Reflect.get(manager, 'failedFenceUnconfirmed')
+    // The old implementation spins in dispose after this failure; release it
+    // before asserting RED so the test process can exit.
+    if (!observedFailure) await manager.stopSaving()
+    await disposing
+    expect(observedFailure).toBe(true)
+    expect(writes).toBe(1)
+    expect(memory.mutations()).toBe(0)
+  })
+
+  it('invalidates a started recovery on dispose and drains it across repeated calls', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let reads = 0
+    let releaseRead!: () => void
+    let markReadStarted!: () => void
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve
+    })
+    let blockRecoveryRead = false
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (blockRecoveryRead) {
+            blockRecoveryRead = false
+            markReadStarted()
+            await new Promise<void>((resolve) => {
+              releaseRead = resolve
+            })
+          }
+          if (reads > 1 && !readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          throw new Error('write lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    manager.requestSaveToDisk()
+    blockRecoveryRead = true
+    const recovery = manager.flushSaveToDisk()
+    await readStarted
+    let disposed = false
+    const firstDispose = manager.dispose().then(() => {
+      disposed = true
+    })
+    const secondDispose = manager.dispose()
+    expect(disposed).toBe(false)
+    readable = true
+    releaseRead()
+    await expect(recovery).rejects.toThrow('persistence has stopped')
+    await Promise.all([firstDispose, secondDispose])
+    expect(disposed).toBe(true)
+    expect(memory.mutations()).toBe(0)
+    await expect(manager.flushSaveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+  })
+
+  it('invalidates a started recovery before stopSaving returns', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let reads = 0
+    let releaseRead!: () => void
+    let markReadStarted!: () => void
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve
+    })
+    let blockRecoveryRead = false
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (blockRecoveryRead) {
+            blockRecoveryRead = false
+            markReadStarted()
+            await new Promise<void>((resolve) => {
+              releaseRead = resolve
+            })
+          }
+          if (reads > 1 && !readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          throw new Error('write lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    manager.requestSaveToDisk()
+    blockRecoveryRead = true
+    const recovery = manager.flushSaveToDisk()
+    await readStarted
+    let stopped = false
+    const stopping = manager.stopSaving().then(() => {
+      stopped = true
+    })
+    expect(stopped).toBe(false)
+    readable = true
+    releaseRead()
+    await expect(recovery).rejects.toThrow('persistence has stopped')
+    await stopping
+    expect(stopped).toBe(true)
+    expect(memory.mutations()).toBe(0)
+  })
+
+  it('lets a new fence supersede recovery and keeps the retired manager closed', async () => {
+    const memory = createStore(stored)
+    let readable = false
+    let reads = 0
+    let releaseRead!: () => void
+    let markReadStarted!: () => void
+    const readStarted = new Promise<void>((resolve) => {
+      markReadStarted = resolve
+    })
+    let blockRecoveryRead = false
+    const manager = new AccountManager(undefined, stored, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          reads++
+          if (blockRecoveryRead) {
+            blockRecoveryRead = false
+            markReadStarted()
+            await new Promise<void>((resolve) => {
+              releaseRead = resolve
+            })
+          }
+          if (reads > 1 && !readable) throw new Error('read unavailable')
+          return memory.store.load(path)
+        },
+        saveMerged: async () => {
+          throw new Error('write lost')
+        },
+      },
+    })
+    manager.requestSaveToDisk()
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    blockRecoveryRead = true
+    const recovery = manager.flushSaveToDisk()
+    await readStarted
+    readable = true
+    const fence = manager.flushAndStopSaving()
+    releaseRead()
+    await expect(recovery).rejects.toThrow('persistence has stopped')
+    await fence
+    const writes = memory.mutations()
+    manager.enableSavingRecovery()
+    manager.requestSaveToDisk()
+    await expect(manager.flushSaveToDisk()).rejects.toThrow(
+      'persistence has stopped',
+    )
+    expect(memory.mutations()).toBe(writes)
+  })
+
   it('confirms the original nested snapshot and then saves late intent', async () => {
     const memory = createStore(stored)
     let releaseRead!: () => void
