@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from 'bun:test'
+import { describe, expect, jest, spyOn, test } from 'bun:test'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -58,6 +58,53 @@ function seedPool(accounts: AccountStorageV4['accounts']): string {
 function readPool(path: string): AccountStorageV4 {
   return JSON.parse(readFileSync(path, 'utf8')) as AccountStorageV4
 }
+
+type OAuthMetadataField = 'projectId' | 'managedProjectId' | 'label'
+
+function setOAuthMetadataField(
+  account: AccountStorageV4['accounts'][number],
+  field: OAuthMetadataField,
+  value: string,
+): AccountStorageV4['accounts'][number] {
+  switch (field) {
+    case 'projectId':
+      return { ...account, projectId: value }
+    case 'managedProjectId':
+      return { ...account, managedProjectId: value }
+    case 'label':
+      return { ...account, label: value }
+  }
+}
+
+const oauthMetadataCases = [
+  {
+    field: 'projectId',
+    name: 'projectId',
+    refresh: 'same-token|requested-project',
+    projectId: 'fallback-project',
+    label: undefined,
+    expected: 'requested-project',
+    stale: 'old-project',
+  },
+  {
+    field: 'managedProjectId',
+    name: 'managedProjectId',
+    refresh: 'same-token|old-project|requested-managed',
+    projectId: '',
+    label: undefined,
+    expected: 'requested-managed',
+    stale: 'old-managed',
+  },
+  {
+    field: 'label',
+    name: 'label',
+    refresh: 'same-token|old-project|old-managed',
+    projectId: '',
+    label: '',
+    expected: '',
+    stale: 'old-label',
+  },
+] as const
 
 async function setupPoolAdapter(
   overrides: Parameters<typeof createOpenCodeV2AntigravityPlugin>[0],
@@ -536,9 +583,17 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
       let unreadableLoadCalls = 0
       let saveCalls = 0
       let recoveryMutations = 0
+      let recoveryMutationAttempts = 0
       let storageReadable = true
       const persisted = deferred<void>()
       const sent: string[] = []
+      const t0 = Date.now()
+      const t1 = t0 + 5_000
+      let restoreDateNow: (() => void) | undefined
+      let fakeTimersEnabled = false
+      let timersRestoredMocks = false
+      let persistenceDeadline: ReturnType<typeof setTimeout> | undefined
+      let restoreStoreMutate: (() => void) | undefined
       const captured = await setupPoolAdapter({
         authorizeAntigravity: async () => ({
           url: 'https://accounts.example/authorize?state=pool-state',
@@ -602,18 +657,27 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
         }
         return saveAccountStorage(file, next)
       })
-      const storeMutate = spyOn(
+      const initialStoreMutate = spyOn(
         defaultAccountStorageStore,
         'mutate',
       ).mockImplementation(async (file, mutator, options) => {
+        recoveryMutationAttempts++
         const result = await mutateAccountStorage(file, mutator, options)
         recoveryMutations++
-        persisted.resolve()
         return result
       })
+      restoreStoreMutate = () => initialStoreMutate.mockRestore()
       try {
+        const useFirstRequestTime = spyOn(Date, 'now').mockReturnValue(t0)
+        restoreDateNow = () => useFirstRequestTime.mockRestore()
         expect((await titleRequest(captured.hook)).ok).toBe(true)
+        restoreDateNow()
+        restoreDateNow = undefined
         expect(sent).toEqual(['old-a', 'token-b'])
+
+        jest.useFakeTimers()
+        fakeTimersEnabled = true
+        jest.setSystemTime(t0)
         const callback = (await captured.oauth.authorize()).callback
         let fenceError: unknown
         try {
@@ -641,23 +705,58 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
               readPool(path).accounts[0]?.rateLimitResetTimes ?? {},
             ).some((resetAt) => typeof resetAt === 'number'),
           ).toBe(true)
+        expect(readPool(path).accounts[1]?.lastUsed).toBe(
+          failedWrite === 'already-committed' ? t0 : 2,
+        )
 
         const idleLoadCount = storeLoadCalls
         const idleSaveCount = saveCalls
-        await Bun.sleep(1050)
+        const idleRecoveryCount = recoveryMutations
+        const idleMutationAttemptCount = recoveryMutationAttempts
+        await jest.advanceTimersByTime(1_000)
         expect(storeLoadCalls).toBe(idleLoadCount)
         expect(saveCalls).toBe(idleSaveCount)
+        expect(recoveryMutations).toBe(idleRecoveryCount)
+        expect(recoveryMutationAttempts).toBe(idleMutationAttemptCount)
 
+        jest.useRealTimers()
+        fakeTimersEnabled = false
+        timersRestoredMocks = true
+        restoreStoreMutate = undefined
         storageReadable = true
+        const storeMutate = spyOn(
+          defaultAccountStorageStore,
+          'mutate',
+        ).mockImplementation(async (file, mutator, options) => {
+          recoveryMutationAttempts++
+          const result = await mutateAccountStorage(file, mutator, options)
+          recoveryMutations++
+          if (
+            result.accounts.some(
+              (account) =>
+                account.email === 'b@example.test' && account.lastUsed === t1,
+            )
+          )
+            persisted.resolve()
+          return result
+        })
+        restoreStoreMutate = () => storeMutate.mockRestore()
+        const useRecoveryRequestTime = spyOn(Date, 'now').mockReturnValue(t1)
+        restoreDateNow = () => useRecoveryRequestTime.mockRestore()
         expect((await titleRequest(captured.hook)).ok).toBe(true)
         expect(sent.slice(-1)).toEqual(['token-b'])
-        await Promise.race([
-          persisted.promise,
-          Bun.sleep(3000).then(() => {
-            throw new Error('successful request did not recover account state')
-          }),
-        ])
-        await Bun.sleep(10)
+        const completionDeadline = new Promise<void>((_resolve, reject) => {
+          persistenceDeadline = setTimeout(() => {
+            reject(
+              new Error(
+                'successful request did not commit the T1 account state',
+              ),
+            )
+          }, 3_000)
+        })
+        await Promise.race([persisted.promise, completionDeadline])
+        restoreDateNow()
+        restoreDateNow = undefined
         expect(oauthMutations).toBe(0)
         if (failedWrite === 'already-committed')
           expect(recoveryMutations).toBe(1)
@@ -668,11 +767,19 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
             (resetAt) => typeof resetAt === 'number',
           ),
         ).toBe(true)
-        expect(recovered.accounts[1]?.lastUsed).toBeGreaterThan(2)
+        expect(recovered.accounts[1]?.lastUsed).toBe(t1)
       } finally {
-        storeLoad.mockRestore()
-        save.mockRestore()
-        storeMutate.mockRestore()
+        if (persistenceDeadline) clearTimeout(persistenceDeadline)
+        restoreDateNow?.()
+        if (fakeTimersEnabled) {
+          jest.useRealTimers()
+          timersRestoredMocks = true
+        }
+        if (!timersRestoredMocks) {
+          storeLoad.mockRestore()
+          save.mockRestore()
+        }
+        restoreStoreMutate?.()
         await captured.cleanup()
       }
     })
@@ -1658,6 +1765,376 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
       expect(
         readPool(path).accounts.map((account) => account.refreshToken),
       ).toEqual(['token-b'])
+    } finally {
+      await captured.cleanup()
+    }
+  })
+
+  for (const metadataCase of oauthMetadataCases) {
+    test(`rejects a no-op OAuth write when ${metadataCase.name} is not confirmed`, async () => {
+      const path = seedPool([
+        {
+          email: 'a@example.test',
+          refreshToken: 'same-token',
+          projectId: 'old-project',
+          managedProjectId: 'old-managed',
+          label: 'old-label',
+          addedAt: 1,
+          lastUsed: 2,
+          enabled: true,
+        },
+        {
+          email: 'b@example.test',
+          refreshToken: 'token-b',
+          addedAt: 3,
+          lastUsed: 4,
+          enabled: true,
+        },
+      ])
+      const sent: string[] = []
+      let oauthWrites = 0
+      const captured = await setupPoolAdapter({
+        authorizeAntigravity: async () => ({
+          url: 'https://accounts.example/authorize?state=pool-state',
+          verifier: 'verifier',
+          projectId: '',
+        }),
+        waitForAntigravityCode: async () => 'code',
+        exchangeAntigravity: async () => ({
+          type: 'success',
+          refresh: metadataCase.refresh,
+          access: 'access',
+          expires: Date.now() + 600_000,
+          email: 'a@example.test',
+          projectId: metadataCase.projectId,
+          ...(metadataCase.label === undefined
+            ? {}
+            : { label: metadataCase.label }),
+        }),
+        mutateAccountStorage: async (file) => {
+          oauthWrites++
+          // Return the actual storage state without running the proposed update.
+          return (await loadAccountStorage(file))!
+        },
+        refreshAntigravityToken: async (refresh) => ({
+          refresh,
+          access: refresh,
+          expires: Date.now() + 600_000,
+        }),
+        send: async ({ auth }) => {
+          sent.push(auth.access ?? '')
+          return auth.access === 'same-token'
+            ? new Response(
+                JSON.stringify({
+                  error: { status: 'ACCOUNT_INELIGIBLE', message: 'blocked' },
+                }),
+                { status: 403 },
+              )
+            : successResponse()
+        },
+      })
+      try {
+        await expect(
+          (await captured.oauth.authorize()).callback,
+        ).rejects.toThrow('not confirmed on disk')
+        expect(oauthWrites).toBe(1)
+        expect(readPool(path).accounts[0]?.refreshToken).toBe('same-token')
+        expect((await titleRequest(captured.hook)).ok).toBe(true)
+        expect(sent.at(-1)).toBe('token-b')
+      } finally {
+        await captured.cleanup()
+      }
+    })
+
+    test(`rejects an overwritten OAuth write when ${metadataCase.name} is stale`, async () => {
+      const path = seedPool([
+        {
+          email: 'a@example.test',
+          refreshToken: 'same-token',
+          projectId: 'old-project',
+          managedProjectId: 'old-managed',
+          label: 'old-label',
+          addedAt: 1,
+          lastUsed: 2,
+          enabled: true,
+        },
+        {
+          email: 'b@example.test',
+          refreshToken: 'token-b',
+          addedAt: 3,
+          lastUsed: 4,
+          enabled: true,
+        },
+      ])
+      const sent: string[] = []
+      let oauthWrites = 0
+      const captured = await setupPoolAdapter({
+        authorizeAntigravity: async () => ({
+          url: 'https://accounts.example/authorize?state=pool-state',
+          verifier: 'verifier',
+          projectId: '',
+        }),
+        waitForAntigravityCode: async () => 'code',
+        exchangeAntigravity: async () => ({
+          type: 'success',
+          refresh: metadataCase.refresh,
+          access: 'access',
+          expires: Date.now() + 600_000,
+          email: 'a@example.test',
+          projectId: metadataCase.projectId,
+          ...(metadataCase.label === undefined
+            ? {}
+            : { label: metadataCase.label }),
+        }),
+        mutateAccountStorage: async (file, mutator) => {
+          oauthWrites++
+          const committed = await mutateAccountStorage(file, mutator)
+          await mutateAccountStorage(file, (current) => ({
+            ...current,
+            accounts: current.accounts.map((account) =>
+              account.email === 'a@example.test'
+                ? setOAuthMetadataField(
+                    account,
+                    metadataCase.field,
+                    metadataCase.stale,
+                  )
+                : account,
+            ),
+          }))
+          return committed
+        },
+        refreshAntigravityToken: async (refresh) => ({
+          refresh,
+          access: refresh,
+          expires: Date.now() + 600_000,
+        }),
+        send: async ({ auth }) => {
+          sent.push(auth.access ?? '')
+          return auth.access === 'same-token'
+            ? new Response(
+                JSON.stringify({
+                  error: { status: 'ACCOUNT_INELIGIBLE', message: 'blocked' },
+                }),
+                { status: 403 },
+              )
+            : successResponse()
+        },
+      })
+      try {
+        await expect(
+          (await captured.oauth.authorize()).callback,
+        ).rejects.toThrow('not confirmed on disk')
+        expect(oauthWrites).toBe(1)
+        expect(readPool(path).accounts[0]?.[metadataCase.field]).toBe(
+          metadataCase.stale,
+        )
+        expect(readPool(path).accounts[0]?.refreshToken).toBe('same-token')
+        expect((await titleRequest(captured.hook)).ok).toBe(true)
+        expect(sent.at(-1)).toBe('token-b')
+      } finally {
+        await captured.cleanup()
+      }
+    })
+  }
+
+  test('confirms already-durable explicit OAuth fields without invoking the mutator', async () => {
+    const path = seedPool([
+      {
+        email: 'existing@example.test',
+        refreshToken: 'same-token',
+        projectId: 'packed-project',
+        managedProjectId: 'managed-project',
+        label: '',
+        addedAt: 1,
+        lastUsed: 2,
+        fingerprint: {
+          deviceId: 'device-before',
+          sessionToken: 'session-before',
+          userAgent: buildAntigravityHarnessUserAgent(),
+          apiClient: 'antigravity-cli',
+          clientMetadata: {
+            ideType: 'ANTIGRAVITY',
+            platform: 'MACOS',
+            pluginType: 'ANTIGRAVITY',
+          },
+          createdAt: 1,
+        },
+      },
+    ])
+    let oauthWrites = 0
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'same-token|packed-project|managed-project',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        projectId: 'fallback-project',
+        label: '',
+      }),
+      mutateAccountStorage: async (file) => {
+        oauthWrites++
+        // A storage adapter may report success without invoking the mutator.
+        return (await loadAccountStorage(file))!
+      },
+    })
+    try {
+      await expect(
+        (await captured.oauth.authorize()).callback,
+      ).resolves.toMatchObject({
+        refresh: 'same-token|packed-project|managed-project',
+      })
+      expect(oauthWrites).toBe(1)
+      expect(readPool(path).accounts[0]).toMatchObject({
+        email: 'existing@example.test',
+        refreshToken: 'same-token',
+        projectId: 'packed-project',
+        managedProjectId: 'managed-project',
+        label: '',
+      })
+      expect(readPool(path).accounts[0]?.enabled).toBeUndefined()
+    } finally {
+      await captured.cleanup()
+    }
+  })
+
+  test('confirms explicit OAuth fields despite unrelated durable changes before readback', async () => {
+    const path = seedPool([
+      {
+        email: 'a@example.test',
+        refreshToken: 'same-token',
+        projectId: 'old-project',
+        managedProjectId: 'old-managed',
+        label: 'old-label',
+        addedAt: 1,
+        lastUsed: 2,
+        enabled: true,
+        rateLimitResetTimes: { gemini: 10 },
+        fingerprint: {
+          deviceId: 'device-before',
+          sessionToken: 'session-before',
+          userAgent: buildAntigravityHarnessUserAgent(),
+          apiClient: 'antigravity-cli',
+          clientMetadata: {
+            ideType: 'ANTIGRAVITY',
+            platform: 'MACOS',
+            pluginType: 'ANTIGRAVITY',
+          },
+          createdAt: 1,
+        },
+      },
+    ])
+    let oauthWrites = 0
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'same-token|packed-project|managed-project',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: 'fallback-project',
+        label: '',
+      }),
+      mutateAccountStorage: async (file, mutator) => {
+        oauthWrites++
+        const committed = await mutateAccountStorage(file, mutator)
+        await mutateAccountStorage(file, (current) => ({
+          ...current,
+          accounts: current.accounts.map((account) =>
+            account.email === 'a@example.test'
+              ? {
+                  ...account,
+                  lastUsed: 999,
+                  rateLimitResetTimes: { gemini: 20 },
+                  fingerprint: {
+                    deviceId: 'device-after',
+                    sessionToken: 'session-after',
+                    userAgent: buildAntigravityHarnessUserAgent(),
+                    apiClient: 'antigravity-cli',
+                    clientMetadata: {
+                      ideType: 'ANTIGRAVITY',
+                      platform: 'MACOS',
+                      pluginType: 'ANTIGRAVITY',
+                    },
+                    createdAt: 999,
+                  },
+                }
+              : account,
+          ),
+        }))
+        return committed
+      },
+    })
+    try {
+      await expect(
+        (await captured.oauth.authorize()).callback,
+      ).resolves.toMatchObject({
+        refresh: 'same-token|packed-project|managed-project',
+      })
+      expect(oauthWrites).toBe(1)
+      expect(readPool(path).accounts[0]).toMatchObject({
+        refreshToken: 'same-token',
+        projectId: 'packed-project',
+        managedProjectId: 'managed-project',
+        label: '',
+        lastUsed: 999,
+        rateLimitResetTimes: { gemini: 20 },
+        fingerprint: { deviceId: 'device-after' },
+      })
+    } finally {
+      await captured.cleanup()
+    }
+  })
+
+  test('inherits omitted and empty OAuth metadata without comparing inherited values', async () => {
+    const path = seedPool([
+      {
+        email: 'a@example.test',
+        refreshToken: 'same-token',
+        projectId: 'kept-project',
+        managedProjectId: 'kept-managed',
+        label: 'kept-label',
+        addedAt: 1,
+        lastUsed: 2,
+        enabled: true,
+      },
+    ])
+    const captured = await setupPoolAdapter({
+      authorizeAntigravity: async () => ({
+        url: 'https://accounts.example/authorize?state=pool-state',
+        verifier: 'verifier',
+        projectId: '',
+      }),
+      waitForAntigravityCode: async () => 'code',
+      exchangeAntigravity: async () => ({
+        type: 'success',
+        refresh: 'same-token||',
+        access: 'access',
+        expires: Date.now() + 600_000,
+        email: 'a@example.test',
+        projectId: '',
+      }),
+    })
+    try {
+      await expect(
+        (await captured.oauth.authorize()).callback,
+      ).resolves.toMatchObject({ refresh: 'same-token|' })
+      expect(readPool(path).accounts[0]).toMatchObject({
+        projectId: 'kept-project',
+        managedProjectId: 'kept-managed',
+        label: 'kept-label',
+      })
     } finally {
       await captured.cleanup()
     }

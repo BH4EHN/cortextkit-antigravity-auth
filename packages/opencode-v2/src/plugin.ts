@@ -148,31 +148,62 @@ export type OpenCodeV2DependencyOverrides = Partial<OpenCodeV2Dependencies>
 
 type OAuthSuccess = Extract<AntigravityTokenExchangeResult, { type: 'success' }>
 
+interface OAuthAccountFields {
+  email?: string
+  refreshToken: string
+  projectId?: string
+  managedProjectId?: string
+  label?: string
+}
+
+function parseOAuthAccountFields(result: OAuthSuccess): OAuthAccountFields {
+  const refreshParts = parseRefreshParts(result.refresh)
+  if (!refreshParts.refreshToken) {
+    throw new Error('Antigravity token exchange returned no refresh token')
+  }
+  return {
+    email: result.email,
+    refreshToken: refreshParts.refreshToken,
+    projectId: refreshParts.projectId || result.projectId || undefined,
+    managedProjectId: refreshParts.managedProjectId,
+    label: result.label,
+  }
+}
+
+function isOAuthAccount(
+  account: AccountStorageV4['accounts'][number],
+  fields: OAuthAccountFields,
+): boolean {
+  return fields.email
+    ? account.email === fields.email
+    : account.refreshToken === fields.refreshToken
+}
+
+function findOAuthAccount(
+  accounts: AccountStorageV4['accounts'],
+  fields: OAuthAccountFields,
+) {
+  return accounts.find((account) => isOAuthAccount(account, fields))
+}
+
 export function upsertOAuthAccount(
   current: AccountStorageV4,
   result: OAuthSuccess,
   now: number,
 ): AccountStorageV4 {
-  const refreshParts = parseRefreshParts(result.refresh)
-  if (!refreshParts.refreshToken) {
-    throw new Error('Antigravity token exchange returned no refresh token')
-  }
+  const fields = parseOAuthAccountFields(result)
   const existingIndex = current.accounts.findIndex((account) =>
-    result.email
-      ? account.email === result.email
-      : account.refreshToken === refreshParts.refreshToken,
+    isOAuthAccount(account, fields),
   )
   const existing =
     existingIndex >= 0 ? current.accounts[existingIndex] : undefined
   const account = {
     ...existing,
-    email: result.email ?? existing?.email,
-    label: result.label ?? existing?.label,
-    refreshToken: refreshParts.refreshToken,
-    projectId:
-      refreshParts.projectId || result.projectId || existing?.projectId,
-    managedProjectId:
-      refreshParts.managedProjectId ?? existing?.managedProjectId,
+    email: fields.email ?? existing?.email,
+    label: fields.label ?? existing?.label,
+    refreshToken: fields.refreshToken,
+    projectId: fields.projectId ?? existing?.projectId,
+    managedProjectId: fields.managedProjectId ?? existing?.managedProjectId,
     addedAt: existing?.addedAt ?? now,
     lastUsed: now,
     enabled: true,
@@ -694,26 +725,26 @@ export function createOpenCodeV2AntigravityPlugin(
 
       const findConfirmedOAuthAccount = (
         stored: AccountStorageV4 | null,
-        result: OAuthSuccess,
+        fields: OAuthAccountFields,
       ) => {
-        const refreshToken = parseRefreshParts(result.refresh).refreshToken
-        return stored?.accounts.find((account) =>
-          result.email
-            ? account.email === result.email
-            : account.refreshToken === refreshToken,
-        )
+        return stored ? findOAuthAccount(stored.accounts, fields) : undefined
       }
 
       const isConfirmedOAuthAccount = (
         stored: AccountStorageV4 | null,
         result: OAuthSuccess,
       ): boolean => {
-        const refreshToken = parseRefreshParts(result.refresh).refreshToken
-        const saved = findConfirmedOAuthAccount(stored, result)
+        const fields = parseOAuthAccountFields(result)
+        const saved = findConfirmedOAuthAccount(stored, fields)
         return !!(
           saved &&
-          saved.refreshToken === refreshToken &&
-          saved.enabled !== false
+          saved.refreshToken === fields.refreshToken &&
+          saved.enabled !== false &&
+          (fields.projectId === undefined ||
+            saved.projectId === fields.projectId) &&
+          (fields.managedProjectId === undefined ||
+            saved.managedProjectId === fields.managedProjectId) &&
+          (fields.label == null || saved.label === fields.label)
         )
       }
 

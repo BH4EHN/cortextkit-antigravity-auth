@@ -393,6 +393,7 @@ export class AccountManager {
   private savingRecoveryGeneration = 0
   private savingRecoveryInFlight: Promise<void> | null = null
   private saveQueue: Promise<void> = Promise.resolve()
+  private stopInFlight: Promise<void> | null = null
   private acceptedSaves = new Set<Promise<void>>()
   private acceptedSaveFailure: unknown = null
   private pendingSaveIntents: Array<{
@@ -2174,7 +2175,7 @@ export class AccountManager {
       const requestedVersion = this.saveRequestVersion
       await this.startSavingRecovery()
       if (requestedVersion > this.recoveryConfirmedVersion) {
-        await this.flushSaveToDisk({ strict: true })
+        await this.flushSaveToDisk(options)
       }
       return
     }
@@ -2293,14 +2294,14 @@ export class AccountManager {
     } catch (error) {
       if (error instanceof AccountManagerPersistenceError) {
         if (error.state === 'retryable') {
-          this.storageAdmission = 'open'
+          if (!this.persistenceStopped) this.storageAdmission = 'open'
         } else {
           this.failedFenceUnconfirmed = true
         }
         throw error
       }
       if (isStorageLockContention(error)) {
-        this.storageAdmission = 'open'
+        if (!this.persistenceStopped) this.storageAdmission = 'open'
         throw new AccountManagerPersistenceError('retryable', error)
       }
       this.failedFenceUnconfirmed = true
@@ -2314,34 +2315,56 @@ export class AccountManager {
    * The caller should flush intended state first, then await this method
    * before starting the mutation.
    */
-  async stopSaving(): Promise<void> {
+  stopSaving(): Promise<void> {
     this.invalidateSavingRecovery()
-    if (this.persistenceStopped) {
-      await this.saveInFlight
-      await this.savingRecoveryInFlight?.catch(() => {})
+    if (!this.persistenceStopped) {
+      this.persistenceStopped = true
+      this.storageAdmission = 'stopped'
+      this.disposed = true
+      if (this.saveTimeout) {
+        clearTimeout(this.saveTimeout)
+        this.saveTimeout = null
+      }
       this.savePending = false
+      const resolvers = this.savePromiseResolvers
+      this.savePromiseResolvers = []
+      for (const { reject } of resolvers) {
+        reject(new Error('Account manager persistence has stopped'))
+      }
+    }
+    if (this.stopInFlight) return this.stopInFlight
+    const stopping = this.finishStopSaving()
+    this.stopInFlight = stopping
+    return stopping
+  }
+
+  private async finishStopSaving(): Promise<void> {
+    while (true) {
+      const inFlight = this.saveInFlight
+      const directSaves = [...this.directSaves]
+      const saveQueue = this.saveQueue
+      const fenceInFlight = this.fenceInFlight
+      const recoveryInFlight = this.savingRecoveryInFlight
       await Promise.all(
-        [...this.directSaves].map((save) => save.catch(() => {})),
+        [
+          ...directSaves,
+          ...(inFlight ? [inFlight] : []),
+          saveQueue,
+          ...(fenceInFlight ? [fenceInFlight] : []),
+          ...(recoveryInFlight ? [recoveryInFlight] : []),
+        ].map((task) => task.catch(() => {})),
       )
-      return
+      this.savePending = false
+      if (
+        !this.saveInFlight &&
+        this.directSaves.size === 0 &&
+        this.saveQueue === saveQueue &&
+        !this.fenceInFlight &&
+        !this.savingRecoveryInFlight
+      ) {
+        return
+      }
     }
-    this.persistenceStopped = true
-    this.storageAdmission = 'stopped'
-    this.disposed = true
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout)
-      this.saveTimeout = null
-    }
-    this.savePending = false
-    const resolvers = this.savePromiseResolvers
-    this.savePromiseResolvers = []
-    for (const { reject } of resolvers) {
-      reject(new Error('Account manager persistence has stopped'))
-    }
-    await this.saveInFlight
-    await this.savingRecoveryInFlight?.catch(() => {})
-    this.savePending = false
-    await Promise.all([...this.directSaves].map((save) => save.catch(() => {})))
   }
 
   dispose(): Promise<void> {
