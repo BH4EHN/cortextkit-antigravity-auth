@@ -6,6 +6,7 @@ import {
   type AccountMetadataV2 as AccountMetadata,
   type AccountStorageV2 as AccountStorage,
   type AccountStorageV4,
+  createAccountStorageStore,
   deduplicateAccountsByEmail,
   ensureGitignore,
   ensureGitignoreSync,
@@ -13,6 +14,118 @@ import {
   mergeAccountStorage,
   migrateV2ToV3,
 } from './storage'
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+describe('OpenCode AccountManager storage adapter', () => {
+  it('holds the real file lock across the callback and preserves concurrent pool changes', async () => {
+    const configDir = await mkdtemp(join(tmpdir(), 'antigravity-store-lock-'))
+    const path = join(configDir, 'antigravity-accounts.json')
+    const store = createAccountStorageStore()
+    const initial: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        { refreshToken: 'a', addedAt: 1, lastUsed: 0 },
+        { refreshToken: 'b', addedAt: 1, lastUsed: 0 },
+      ],
+      activeIndex: 0,
+    }
+    const firstEntered = deferred()
+    const releaseFirst = deferred()
+    const firstFinished = deferred()
+    const contenderSawLock = deferred()
+    let secondCallbackEntered = false
+
+    try {
+      await store.mutate(path, () => initial)
+
+      const first = store
+        .mutate(path, async (current) => {
+          firstEntered.resolve()
+          await releaseFirst.promise
+          current.accounts[0]!.label = 'A updated'
+          return current
+        })
+        .finally(() => firstFinished.resolve())
+
+      await firstEntered.promise
+      const second = store.mutate(
+        path,
+        (current) => {
+          secondCallbackEntered = true
+          current.accounts[1]!.label = 'B updated'
+          current.accounts.push({
+            refreshToken: 'oauth-added',
+            addedAt: 2,
+            lastUsed: 0,
+          })
+          return current
+        },
+        {
+          sleep: async () => {
+            contenderSawLock.resolve()
+            await firstFinished.promise
+          },
+        },
+      )
+
+      await contenderSawLock.promise
+      expect(secondCallbackEntered).toBe(false)
+
+      releaseFirst.resolve()
+      const [firstSaved, secondSaved] = await Promise.all([first, second])
+      const onDisk = await store.load(path)
+      if (!onDisk) throw new Error('Storage disappeared after concurrent saves')
+
+      expect(secondSaved).toEqual(onDisk)
+      expect(firstSaved.accounts[0]?.label).toBe('A updated')
+      expect(secondSaved.accounts).toEqual([
+        expect.objectContaining({ refreshToken: 'a', label: 'A updated' }),
+        expect.objectContaining({ refreshToken: 'b', label: 'B updated' }),
+        expect.objectContaining({ refreshToken: 'oauth-added' }),
+      ])
+    } finally {
+      releaseFirst.resolve()
+      await rm(configDir, { recursive: true, force: true })
+    }
+  })
+
+  it('returns the actual merged state committed by saveMerged', async () => {
+    const configDir = await mkdtemp(join(tmpdir(), 'antigravity-store-merge-'))
+    const path = join(configDir, 'antigravity-accounts.json')
+    const store = createAccountStorageStore()
+
+    try {
+      await store.mutate(path, () => ({
+        version: 4,
+        accounts: [{ refreshToken: 'existing', addedAt: 1, lastUsed: 0 }],
+        activeIndex: 0,
+      }))
+
+      const saved = await store.saveMerged(path, {
+        version: 4,
+        accounts: [{ refreshToken: 'incoming', addedAt: 2, lastUsed: 0 }],
+        activeIndex: 1,
+      })
+      const onDisk = await store.load(path)
+      if (!onDisk) throw new Error('Storage disappeared after merged save')
+
+      expect(saved).toEqual(onDisk)
+      expect(saved.accounts.map((account) => account.refreshToken)).toEqual([
+        'existing',
+        'incoming',
+      ])
+    } finally {
+      await rm(configDir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('deduplicateAccountsByEmail', () => {
   it('returns empty array for empty input', () => {

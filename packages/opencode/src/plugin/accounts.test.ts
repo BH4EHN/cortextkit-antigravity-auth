@@ -5,9 +5,12 @@ import {
   expect,
   it,
   jest,
-  mock,
   spyOn,
 } from 'bun:test'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { AccountStorageLockContentionError } from '@cortexkit/antigravity-auth-core'
 
 import {
   AccountManager,
@@ -16,22 +19,12 @@ import {
   parseRateLimitReason,
   resolveQuotaGroup,
 } from './accounts'
-// Mock storage to prevent test data from leaking to real config files.
-// Bun's `mock.module` doesn't support the `importOriginal` callback that
-// Vitest exposes, so we capture the real exports first and merge.
-import * as realStorage from './storage'
 import {
   type AccountStorageV4,
-  saveAccounts,
-  saveAccountsReplace,
+  createAccountStorageStore,
+  loadAccounts,
 } from './storage'
 import type { OAuthAuthDetails } from './types'
-
-mock.module('./storage', () => ({
-  ...realStorage,
-  saveAccounts: mock().mockResolvedValue(undefined),
-  saveAccountsReplace: mock().mockResolvedValue(undefined),
-}))
 
 describe('AccountManager', () => {
   beforeEach(() => {
@@ -42,6 +35,96 @@ describe('AccountManager', () => {
 
   afterEach(() => {
     globalThis.unstubAllGlobals()
+  })
+
+  it('persists through the configured storagePath', async () => {
+    const configDir = await mkdtemp(join(tmpdir(), 'antigravity-manager-path-'))
+    const storagePath = join(configDir, 'custom-accounts.json')
+    const stored: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        { refreshToken: 'custom-path-account', addedAt: 1, lastUsed: 0 },
+      ],
+      activeIndex: 0,
+    }
+    const manager = new AccountManager(undefined, stored, { storagePath })
+
+    try {
+      await manager.saveToDiskReplace()
+      const onDisk = JSON.parse(await readFile(storagePath, 'utf8'))
+      expect(onDisk.accounts).toHaveLength(1)
+      expect(onDisk.accounts[0]).toMatchObject({
+        refreshToken: 'custom-path-account',
+        addedAt: 1,
+        lastUsed: 0,
+      })
+    } finally {
+      await manager.dispose()
+      await rm(configDir, { recursive: true, force: true })
+    }
+  })
+
+  it('retries a scoped save after real lock contention without dropping pool changes', async () => {
+    const configDir = await mkdtemp(
+      join(tmpdir(), 'antigravity-manager-retry-'),
+    )
+    const storagePath = join(configDir, 'antigravity-accounts.json')
+    const store = createAccountStorageStore()
+    const initial: AccountStorageV4 = {
+      version: 4,
+      accounts: [
+        { refreshToken: 'a', addedAt: 1, lastUsed: 0 },
+        { refreshToken: 'b', addedAt: 1, lastUsed: 0 },
+      ],
+      activeIndex: 0,
+    }
+    let enteredLock!: () => void
+    const lockEntered = new Promise<void>((resolve) => {
+      enteredLock = resolve
+    })
+    let releaseLock!: () => void
+    const lockRelease = new Promise<void>((resolve) => {
+      releaseLock = resolve
+    })
+    const manager = new AccountManager(undefined, initial, { storagePath })
+
+    try {
+      await store.mutate(storagePath, () => initial)
+      manager.getAccounts()[0]!.label = 'A updated'
+
+      const concurrentWrite = store.mutate(storagePath, async (current) => {
+        enteredLock()
+        await lockRelease
+        current.accounts[1]!.label = 'B updated'
+        current.accounts.push({
+          refreshToken: 'oauth-added',
+          addedAt: 2,
+          lastUsed: 0,
+        })
+        return current
+      })
+      await lockEntered
+
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      releaseLock()
+      await concurrentWrite
+
+      // The typed first failure switches AccountManager to scoped persistence.
+      await manager.saveToDisk()
+
+      const persisted = await store.load(storagePath)
+      expect(persisted?.accounts).toEqual([
+        expect.objectContaining({ refreshToken: 'a', label: 'A updated' }),
+        expect.objectContaining({ refreshToken: 'b', label: 'B updated' }),
+        expect.objectContaining({ refreshToken: 'oauth-added' }),
+      ])
+    } finally {
+      releaseLock()
+      await manager.dispose()
+      await rm(configDir, { recursive: true, force: true })
+    }
   })
 
   it('treats on-disk storage as source of truth, even when empty', () => {
@@ -85,17 +168,11 @@ describe('AccountManager', () => {
     expect(manager.setAccountEnabled(0, true)).toBe(false)
 
     await manager.saveToDisk()
-    expect(saveAccounts as any).toHaveBeenCalledWith(
-      expect.objectContaining({
-        accounts: [
-          expect.objectContaining({
-            enabled: false,
-            accountIneligible: true,
-            eligibilityStateUpdatedAt: 1_000,
-          }),
-        ],
-      }),
-    )
+    expect((await loadAccounts())?.accounts[0]).toMatchObject({
+      enabled: false,
+      accountIneligible: true,
+      eligibilityStateUpdatedAt: 1_000,
+    })
 
     jest.setSystemTime(2_000)
     expect(manager.clearAccountAccessBlocks(0, true)).toBe(true)
@@ -105,6 +182,11 @@ describe('AccountManager', () => {
       eligibilityStateUpdatedAt: 2_000,
     })
     await manager.saveToDisk()
+    expect((await loadAccounts())?.accounts[0]).toMatchObject({
+      enabled: true,
+      accountIneligible: false,
+      eligibilityStateUpdatedAt: 2_000,
+    })
     jest.clearAllTimers()
   })
 
@@ -509,9 +591,6 @@ describe('AccountManager', () => {
   })
 
   it('persists account removal via replace (no merge) so deletions stick', async () => {
-    ;(saveAccounts as any).mockClear()
-    ;(saveAccountsReplace as any).mockClear()
-
     const stored: AccountStorageV4 = {
       version: 4,
       accounts: [
@@ -529,13 +608,9 @@ describe('AccountManager', () => {
 
     await manager.saveToDiskReplace()
 
-    // Must use replace (full overwrite), not merge — merge re-reads the file and
-    // resurrects the deleted account.
-    expect(saveAccountsReplace).toHaveBeenCalledTimes(1)
-    const saved = (saveAccountsReplace as any).mock.calls.at(-1)?.[0]
-    expect(
-      saved?.accounts.map((a: { refreshToken: string }) => a.refreshToken),
-    ).toEqual(['r1'])
+    expect((await loadAccounts())?.accounts.map((a) => a.refreshToken)).toEqual(
+      ['r1'],
+    )
   })
 
   it('keeps round-robin cursors separate by model family', () => {
@@ -565,7 +640,6 @@ describe('AccountManager', () => {
   it('does not persist transient cooldown and switch metadata', async () => {
     jest.useFakeTimers()
     jest.setSystemTime(new Date(0))
-    ;(saveAccounts as any).mockClear()
 
     const stored: AccountStorageV4 = {
       version: 4,
@@ -582,7 +656,7 @@ describe('AccountManager', () => {
 
     await manager.saveToDisk()
 
-    const saved = (saveAccounts as any).mock.calls.at(-1)?.[0]
+    const saved = await loadAccounts()
     expect(saved?.accounts[0]).not.toHaveProperty('lastSwitchReason')
     expect(saved?.accounts[0]).not.toHaveProperty('coolingDownUntil')
     expect(saved?.accounts[0]).not.toHaveProperty('cooldownReason')

@@ -740,6 +740,8 @@ export function createOpenCodeV2AntigravityPlugin(
           saved &&
           saved.refreshToken === fields.refreshToken &&
           saved.enabled !== false &&
+          saved.accountIneligible !== true &&
+          saved.verificationRequired !== true &&
           (fields.projectId === undefined ||
             saved.projectId === fields.projectId) &&
           (fields.managedProjectId === undefined ||

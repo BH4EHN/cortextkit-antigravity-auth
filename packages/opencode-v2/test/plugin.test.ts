@@ -1765,6 +1765,126 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
     }
   })
 
+  for (const blockedState of [
+    { accountIneligible: true },
+    { verificationRequired: true },
+  ]) {
+    const flag = Object.keys(blockedState)[0]
+    test(`rejects a no-op OAuth readback with ${flag} still set`, async () => {
+      const path = seedPool([
+        {
+          email: 'a@example.test',
+          refreshToken: 'same-token',
+          addedAt: 1,
+          lastUsed: 2,
+          enabled: true,
+          ...blockedState,
+        },
+        {
+          email: 'b@example.test',
+          refreshToken: 'token-b',
+          addedAt: 3,
+          lastUsed: 4,
+          enabled: true,
+        },
+      ])
+      const sent: string[] = []
+      const captured = await setupPoolAdapter({
+        authorizeAntigravity: async () => ({
+          url: 'https://accounts.example/authorize?state=pool-state',
+          verifier: 'verifier',
+          projectId: '',
+        }),
+        waitForAntigravityCode: async () => 'code',
+        exchangeAntigravity: async () => ({
+          type: 'success',
+          refresh: 'same-token',
+          access: 'access',
+          expires: Date.now() + 600_000,
+          email: 'a@example.test',
+          projectId: '',
+        }),
+        mutateAccountStorage: async (file) => (await loadAccountStorage(file))!,
+        refreshAntigravityToken: async (refresh) => ({
+          refresh,
+          access: refresh,
+          expires: Date.now() + 600_000,
+        }),
+        send: async ({ auth }) => {
+          sent.push(auth.access ?? '')
+          return auth.access === 'same-token'
+            ? new Response(
+                JSON.stringify({
+                  error: { status: 'ACCOUNT_INELIGIBLE', message: 'blocked' },
+                }),
+                { status: 403 },
+              )
+            : successResponse()
+        },
+      })
+      try {
+        await expect(
+          (await captured.oauth.authorize()).callback,
+        ).rejects.toThrow('not confirmed on disk')
+        expect(readPool(path).accounts[0]).toMatchObject({
+          enabled: true,
+          ...blockedState,
+        })
+        expect((await titleRequest(captured.hook)).ok).toBe(true)
+        expect(sent).toEqual(['same-token', 'token-b'])
+      } finally {
+        await captured.cleanup()
+      }
+    })
+  }
+
+  for (const clearState of [
+    {},
+    { accountIneligible: false },
+    { verificationRequired: false },
+  ]) {
+    test(`confirms no-op OAuth readback with clear eligibility flags ${JSON.stringify(clearState)}`, async () => {
+      const path = seedPool([
+        {
+          email: 'a@example.test',
+          refreshToken: 'same-token',
+          addedAt: 1,
+          lastUsed: 2,
+          enabled: true,
+          ...clearState,
+        },
+      ])
+      const captured = await setupPoolAdapter({
+        authorizeAntigravity: async () => ({
+          url: 'https://accounts.example/authorize?state=pool-state',
+          verifier: 'verifier',
+          projectId: '',
+        }),
+        waitForAntigravityCode: async () => 'code',
+        exchangeAntigravity: async () => ({
+          type: 'success',
+          refresh: 'same-token',
+          access: 'access',
+          expires: Date.now() + 600_000,
+          email: 'a@example.test',
+          projectId: '',
+        }),
+        mutateAccountStorage: async (file) => (await loadAccountStorage(file))!,
+      })
+      try {
+        await expect(
+          (await captured.oauth.authorize()).callback,
+        ).resolves.toMatchObject({ refresh: 'same-token|' })
+        expect(readPool(path).accounts[0]).toMatchObject({
+          enabled: true,
+          ...clearState,
+        })
+      } finally {
+        await captured.cleanup()
+      }
+    })
+  }
+
   for (const metadataCase of oauthMetadataCases) {
     test(`rejects a no-op OAuth write when ${metadataCase.name} is not confirmed`, async () => {
       const path = seedPool([

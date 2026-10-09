@@ -30,6 +30,7 @@ import type {
   AccountMetadataV2,
   AccountMetadataV3,
   AccountModelFamily,
+  AccountStorageStore,
   AccountStorageUnreadableReason,
   AccountStorageV2,
   AccountStorageV4,
@@ -344,6 +345,35 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
   return coreLoadAccountStorage(path)
 }
 
+async function prepareAccountStoragePath(path: string): Promise<void> {
+  const configDir = dirname(path)
+  await fs.mkdir(configDir, { recursive: true })
+  await ensureGitignore(configDir)
+}
+
+/**
+ * Build the OpenCode adapter for AccountManager's path-aware store contract.
+ * Every read/modify/write operation uses core's lock-held persistence entry
+ * point, and returns the exact state committed by that operation.
+ */
+export function createAccountStorageStore(): AccountStorageStore {
+  return {
+    load: async (path) => {
+      await ensureGitignore(dirname(path))
+      return coreLoadAccountStorage(path)
+    },
+    saveMerged: async (path, storage) => {
+      await prepareAccountStoragePath(path)
+      return coreSaveAccountStorage(path, storage)
+    },
+    mutate: async (path, mutate, options) => {
+      await prepareAccountStoragePath(path)
+      return coreMutateAccountStorage(path, mutate, options)
+    },
+    clear: async (path) => coreClearAccountStorage(path),
+  }
+}
+
 /**
  * Merge `storage` into the persisted pool. Use this for non-destructive
  * writes (quota cache, eligibility, last-used) so concurrent writers
@@ -351,9 +381,7 @@ export async function loadAccounts(): Promise<AccountStorageV4 | null> {
  */
 export async function saveAccounts(storage: AccountStorageV4): Promise<void> {
   const path = getStoragePath()
-  const configDir = dirname(path)
-  await fs.mkdir(configDir, { recursive: true })
-  await ensureGitignore(configDir)
+  await prepareAccountStoragePath(path)
   await coreSaveAccountStorage(path, storage)
 }
 
@@ -366,9 +394,7 @@ export async function saveAccountsReplace(
   storage: AccountStorageV4,
 ): Promise<void> {
   const path = getStoragePath()
-  const configDir = dirname(path)
-  await fs.mkdir(configDir, { recursive: true })
-  await ensureGitignore(configDir)
+  await prepareAccountStoragePath(path)
   await coreSaveAccountStorageReplace(path, storage)
 }
 
