@@ -64,6 +64,61 @@ function sameStoredState(
   )
 }
 
+type AccountChange = {
+  before: AccountMetadataV3
+  after: AccountMetadataV3
+  fields: Array<keyof AccountMetadataV3>
+}
+
+type SaveIntent = {
+  kind: 'merge' | 'replace'
+  snapshot: AccountStorageV4
+  changes: AccountChange[]
+  structural: boolean
+}
+
+type SaveAttempt = SaveIntent & {
+  baseline: AccountStorageV4 | null | undefined
+  expected?: AccountStorageV4
+  error: unknown
+  scoped?: boolean
+  wholePool?: boolean
+  appliedTokens?: string[]
+  appliedPointers?: boolean
+}
+
+function sameDurableValue(left: unknown, right: unknown): boolean {
+  return isDeepStrictEqual(
+    JSON.parse(JSON.stringify({ value: left })),
+    JSON.parse(JSON.stringify({ value: right })),
+  )
+}
+
+function accountChange(
+  before: AccountMetadataV3,
+  after: AccountMetadataV3,
+): AccountChange {
+  const fields = [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .map((key) => key as keyof AccountMetadataV3)
+    .filter((key) => !sameDurableValue(before[key], after[key]))
+  return { before, after, fields }
+}
+
+function applyAccountChange(
+  current: AccountMetadataV3,
+  change: AccountChange,
+): AccountMetadataV3 {
+  const incoming = {
+    ...current,
+    ...Object.fromEntries(change.fields.map((key) => [key, change.after[key]])),
+  }
+  // Retain the existing project, eligibility, quota-reset and last-used rules.
+  return mergeAccountStorage(
+    { version: 4, accounts: [current], activeIndex: 0 },
+    { version: 4, accounts: [incoming], activeIndex: 0 },
+  ).accounts[0]!
+}
+
 export class AccountManagerPersistenceError extends Error {
   constructor(
     readonly state: 'retryable' | 'unconfirmed',
@@ -396,16 +451,16 @@ export class AccountManager {
   private stopInFlight: Promise<void> | null = null
   private acceptedSaves = new Set<Promise<void>>()
   private acceptedSaveFailure: unknown = null
-  private pendingSaveIntents: Array<{
-    kind: 'merge' | 'replace'
-    snapshot: AccountStorageV4
-  }> = []
-  private failedSaveAttempt: {
-    kind: 'merge' | 'replace'
-    baseline: AccountStorageV4 | null | undefined
-    snapshot: AccountStorageV4
-    error: unknown
-  } | null = null
+  private pendingSaveIntents: SaveIntent[] = []
+  private failedSaveAttempt: SaveAttempt | null = null
+  // Local capture and confirmed disk provenance are deliberately separate:
+  // an unrelated account read from disk has not been incorporated into memory.
+  private localSaveCheckpoint!: AccountStorageV4
+  private persistedOrigin: AccountStorageV4 | null = null
+  private initialMaintenance: AccountChange[] = []
+  private initialPointerMaintenance: AccountStorageV4 | null = null
+  private initialStructurePending = false
+  private scopedPersistence = false
   private savePromiseResolvers: Array<{
     resolve: () => void
     reject: (err: unknown) => void
@@ -432,6 +487,8 @@ export class AccountManager {
     stored: AccountStorageV4 | null | undefined,
     options: AccountManagerOptions,
   ) {
+    // Constructor normalization can mutate fingerprints shared with `stored`.
+    this.persistedOrigin = structuredClone(stored ?? null)
     this.store = options.store
     this.storagePath = options.storagePath ?? ''
     this.onDiagnostic = options.onDiagnostic
@@ -446,6 +503,7 @@ export class AccountManager {
     if (stored && stored.accounts.length === 0) {
       this.accounts = []
       this.cursorByFamily = { claude: 0, gemini: 0 }
+      this.initializeSaveProvenance()
       return
     }
 
@@ -567,6 +625,7 @@ export class AccountManager {
         }
       }
 
+      this.initializeSaveProvenance()
       return
     }
 
@@ -592,6 +651,218 @@ export class AccountManager {
         this.currentAccountIndexByFamily.claude = 0
         this.currentAccountIndexByFamily.gemini = 0
       }
+    }
+    this.initializeSaveProvenance()
+  }
+
+  private initializeSaveProvenance(): void {
+    this.localSaveCheckpoint = structuredClone(this.buildStorageSnapshot())
+    const original = this.persistedOrigin
+    const originalTokens = original?.accounts.map((a) => a.refreshToken) ?? []
+    const normalizedTokens = this.localSaveCheckpoint.accounts.map(
+      (a) => a.refreshToken,
+    )
+    this.initialStructurePending =
+      !sameDurableValue(originalTokens, normalizedTokens) ||
+      new Set(originalTokens).size !== originalTokens.length
+    for (const normalized of this.localSaveCheckpoint.accounts) {
+      const before = original?.accounts.find(
+        (a) => a.refreshToken === normalized.refreshToken,
+      )
+      if (before) {
+        const change = accountChange(before, normalized)
+        // A field omitted by the manager projection is not a deletion intent.
+        // Ordinary merges preserve it from the authoritative stored account.
+        change.fields = change.fields.filter((key) =>
+          Object.hasOwn(normalized, key),
+        )
+        if (change.fields.length > 0) this.initialMaintenance.push(change)
+      }
+    }
+    if (
+      original &&
+      (!sameDurableValue(
+        original.activeIndex,
+        this.localSaveCheckpoint.activeIndex,
+      ) ||
+        !sameDurableValue(
+          original.activeIndexByFamily,
+          this.localSaveCheckpoint.activeIndexByFamily,
+        ))
+    ) {
+      this.initialPointerMaintenance = this.localSaveCheckpoint
+    }
+  }
+
+  private captureSaveIntent(kind: 'merge' | 'replace'): SaveIntent {
+    const snapshot = structuredClone(this.buildStorageSnapshot())
+    const previous = this.localSaveCheckpoint
+    const changes: AccountChange[] = []
+    for (const after of snapshot.accounts) {
+      const before = previous.accounts.find(
+        (a) => a.refreshToken === after.refreshToken,
+      )
+      if (before) {
+        const change = accountChange(before, after)
+        if (change.fields.length > 0) changes.push(change)
+      }
+    }
+    const structural =
+      kind === 'replace' ||
+      !sameDurableValue(
+        previous.accounts.map((a) => a.refreshToken),
+        snapshot.accounts.map((a) => a.refreshToken),
+      ) ||
+      !sameDurableValue(previous.activeIndex, snapshot.activeIndex) ||
+      !sameDurableValue(
+        previous.activeIndexByFamily,
+        snapshot.activeIndexByFamily,
+      )
+    this.localSaveCheckpoint = snapshot
+    return { kind, snapshot, changes, structural }
+  }
+
+  private confirmSavedAttempt(
+    attempt: SaveAttempt,
+    saved: AccountStorageV4,
+  ): void {
+    if (!attempt.scoped || attempt.wholePool) {
+      this.persistedOrigin = structuredClone(saved)
+      this.initialStructurePending = false
+    } else if (this.persistedOrigin) {
+      for (const token of attempt.appliedTokens ?? []) {
+        const index = this.persistedOrigin.accounts.findIndex(
+          (a) => a.refreshToken === token,
+        )
+        const account = saved.accounts.find((a) => a.refreshToken === token)
+        if (index >= 0 && account) {
+          this.persistedOrigin.accounts[index] = structuredClone(account)
+        }
+      }
+      if (attempt.appliedPointers) {
+        this.persistedOrigin.activeIndex = saved.activeIndex
+        this.persistedOrigin.activeIndexByFamily = structuredClone(
+          saved.activeIndexByFamily,
+        )
+      }
+    }
+    this.initialMaintenance = []
+    this.initialPointerMaintenance = null
+  }
+
+  private expectedSaveResult(attempt: SaveAttempt): AccountStorageV4 {
+    if (attempt.expected) return attempt.expected
+    return attempt.kind === 'merge'
+      ? mergeAccountStorage(
+          attempt.baseline ?? { version: 4, accounts: [], activeIndex: 0 },
+          attempt.snapshot,
+        )
+      : attempt.snapshot
+  }
+
+  private async writeScopedIntent(
+    intent: SaveIntent,
+  ): Promise<AccountStorageV4> {
+    const attempt: SaveAttempt = {
+      ...intent,
+      baseline: undefined,
+      expected: undefined,
+      error: undefined,
+      scoped: true,
+      appliedPointers: false,
+      wholePool: intent.structural || this.initialStructurePending,
+      appliedTokens: [],
+    }
+    try {
+      const saved = await this.store.mutate(this.storagePath, (current) => {
+        attempt.baseline = structuredClone(current)
+        const origin = this.persistedOrigin ?? {
+          version: 4,
+          accounts: [],
+          activeIndex: 0,
+        }
+        let next: AccountStorageV4
+        if (attempt.wholePool) {
+          if (!sameStoredState(current, origin)) {
+            throw new AccountManagerPersistenceError(
+              'unconfirmed',
+              new Error('Account pool changed before a structural save'),
+            )
+          }
+          next =
+            intent.kind === 'merge'
+              ? mergeAccountStorage(current, intent.snapshot)
+              : intent.snapshot
+        } else {
+          // Check explicit intent before applying optional initialization work.
+          for (const change of intent.changes) {
+            const token = change.before.refreshToken
+            const expected = origin.accounts.filter(
+              (a) => a.refreshToken === token,
+            )
+            const actual = current.accounts.filter(
+              (a) => a.refreshToken === token,
+            )
+            if (
+              expected.length !== 1 ||
+              actual.length !== 1 ||
+              !sameDurableValue(actual[0], expected[0])
+            ) {
+              throw new AccountManagerPersistenceError(
+                'unconfirmed',
+                new Error('Account changed before a deferred merge'),
+              )
+            }
+          }
+          next = structuredClone(current)
+          for (const maintenance of this.initialMaintenance) {
+            const index = next.accounts.findIndex(
+              (a) => a.refreshToken === maintenance.before.refreshToken,
+            )
+            if (
+              index >= 0 &&
+              sameDurableValue(current.accounts[index], maintenance.before)
+            ) {
+              next.accounts[index] = applyAccountChange(
+                next.accounts[index]!,
+                maintenance,
+              )
+              attempt.appliedTokens!.push(maintenance.before.refreshToken)
+            }
+          }
+          for (const change of intent.changes) {
+            const index = next.accounts.findIndex(
+              (a) => a.refreshToken === change.before.refreshToken,
+            )
+            next.accounts[index] = applyAccountChange(
+              next.accounts[index]!,
+              change,
+            )
+            attempt.appliedTokens!.push(change.before.refreshToken)
+          }
+          if (
+            this.initialPointerMaintenance &&
+            sameStoredState(current, origin)
+          ) {
+            next.activeIndex = this.initialPointerMaintenance.activeIndex
+            next.activeIndexByFamily = structuredClone(
+              this.initialPointerMaintenance.activeIndexByFamily,
+            )
+            attempt.appliedPointers = true
+          }
+        }
+        attempt.expected = structuredClone(next)
+        return next
+      })
+      this.confirmSavedAttempt(attempt, saved)
+      this.failedSaveAttempt = null
+      this.saveFailure = null
+      this.acceptedSaveFailure = null
+      return structuredClone(saved)
+    } catch (error) {
+      attempt.error = error
+      this.failedSaveAttempt = attempt
+      throw error
     }
   }
 
@@ -1804,10 +2075,7 @@ export class AccountManager {
   }
 
   private enqueueSave(kind: 'merge' | 'replace'): Promise<void> {
-    const intent = {
-      kind,
-      snapshot: structuredClone(this.buildStorageSnapshot()),
-    }
+    const intent = this.captureSaveIntent(kind)
     const save = this.saveQueue.then(async () => {
       // Retain this intent before reconciling older work: reconciliation
       // can fail without ever attempting this new snapshot. Capture happened
@@ -1850,13 +2118,7 @@ export class AccountManager {
       if (result === 'missing') {
         guardedBaseline = await this.retryFailedSave()
       } else if (result === 'saved') {
-        guardedBaseline =
-          failed.kind === 'merge'
-            ? mergeAccountStorage(
-                failed.baseline ?? { version: 4, accounts: [], activeIndex: 0 },
-                failed.snapshot,
-              )
-            : failed.snapshot
+        guardedBaseline = this.expectedSaveResult(failed)
       }
     }
     while (this.pendingSaveIntents.length > 0) {
@@ -1877,7 +2139,9 @@ export class AccountManager {
       assertActive?.()
       try {
         let saved: AccountStorageV4
-        if (guardedBaseline !== undefined) {
+        if (this.scopedPersistence) {
+          saved = await this.writeScopedIntent(intent)
+        } else if (guardedBaseline !== undefined) {
           const expected = guardedBaseline
           saved = await this.store.mutate(this.storagePath, (current) => {
             if (!sameStoredState(current, expected)) {
@@ -1898,6 +2162,12 @@ export class AccountManager {
             return snapshot
           })
         }
+        if (!this.scopedPersistence) {
+          this.confirmSavedAttempt(
+            { ...intent, baseline, error: undefined },
+            saved,
+          )
+        }
         this.pendingSaveIntents.shift()
         // Further retained intents must not overwrite changes made between
         // recovery and their lock-held write.
@@ -1905,7 +2175,12 @@ export class AccountManager {
         this.acceptedSaveFailure = null
       } catch (error) {
         this.pendingSaveIntents.shift()
-        this.failedSaveAttempt = { kind, baseline, snapshot, error }
+        if (!this.scopedPersistence) {
+          this.failedSaveAttempt = { ...intent, baseline, error }
+        }
+        if (error instanceof AccountStorageLockContentionError) {
+          this.scopedPersistence = true
+        }
         throw error
       }
     }
@@ -1924,17 +2199,15 @@ export class AccountManager {
     } catch (error) {
       throw new AccountManagerPersistenceError('unconfirmed', error)
     }
-    if (attempt.baseline === undefined) {
+    if (
+      attempt.baseline === undefined ||
+      (attempt.scoped && !attempt.expected)
+    ) {
       throw new AccountManagerPersistenceError('unconfirmed', attempt.error)
     }
-    const expected =
-      attempt.kind === 'merge'
-        ? mergeAccountStorage(
-            attempt.baseline ?? { version: 4, accounts: [], activeIndex: 0 },
-            attempt.snapshot,
-          )
-        : attempt.snapshot
+    const expected = this.expectedSaveResult(attempt)
     if (sameStoredState(current, expected)) {
+      this.confirmSavedAttempt(attempt, expected)
       this.failedSaveAttempt = null
       this.acceptedSaveFailure = null
       return 'saved'
@@ -1949,6 +2222,13 @@ export class AccountManager {
   private async retryFailedSave(): Promise<AccountStorageV4 | undefined> {
     const attempt = this.failedSaveAttempt
     if (!attempt) return
+    if (
+      attempt.scoped ||
+      attempt.error instanceof AccountStorageLockContentionError
+    ) {
+      this.scopedPersistence = true
+      return this.writeScopedIntent(attempt)
+    }
     if (attempt.baseline === undefined) {
       throw new AccountManagerPersistenceError('unconfirmed', attempt.error)
     }
@@ -1967,6 +2247,7 @@ export class AccountManager {
           ? mergeAccountStorage(current, attempt.snapshot)
           : attempt.snapshot
       })
+      this.confirmSavedAttempt(attempt, saved)
       this.failedSaveAttempt = null
       this.saveFailure = null
       this.acceptedSaveFailure = null
@@ -2096,25 +2377,37 @@ export class AccountManager {
         )
       }
       if (this.savePending) {
-        const snapshot = structuredClone(this.buildStorageSnapshot())
+        const intent = this.captureSaveIntent('merge')
+        const { snapshot } = intent
         const capturedVersion = this.saveRequestVersion
         this.savePending = false
         try {
-          await this.store.mutate(this.storagePath, (current) => {
-            if (!sameStoredState(current, baseline)) {
-              throw new AccountManagerPersistenceError(
-                'unconfirmed',
-                new Error('Account state changed before a recovery save'),
-              )
-            }
-            return mergeAccountStorage(current, snapshot)
-          })
+          if (this.scopedPersistence) {
+            await this.writeScopedIntent(intent)
+          } else {
+            const saved = await this.store.mutate(
+              this.storagePath,
+              (current) => {
+                if (!sameStoredState(current, baseline)) {
+                  throw new AccountManagerPersistenceError(
+                    'unconfirmed',
+                    new Error('Account state changed before a recovery save'),
+                  )
+                }
+                return mergeAccountStorage(current, snapshot)
+              },
+            )
+            this.confirmSavedAttempt(
+              { ...intent, baseline, error: undefined },
+              saved,
+            )
+          }
         } catch (error) {
-          this.failedSaveAttempt = {
-            kind: 'merge',
-            baseline,
-            snapshot,
-            error,
+          if (!this.scopedPersistence) {
+            this.failedSaveAttempt = { ...intent, baseline, error }
+          }
+          if (error instanceof AccountStorageLockContentionError) {
+            this.scopedPersistence = true
           }
           this.savePending = true
           this.failedRecoverySnapshot = {
@@ -2253,17 +2546,7 @@ export class AccountManager {
           failed &&
           this.pendingSaveIntents.length > 0
         ) {
-          const recovered =
-            failed.kind === 'merge'
-              ? mergeAccountStorage(
-                  failed.baseline ?? {
-                    version: 4,
-                    accounts: [],
-                    activeIndex: 0,
-                  },
-                  failed.snapshot,
-                )
-              : failed.snapshot
+          const recovered = this.expectedSaveResult(failed)
           await this.enqueueFailedSaveReconciliation(recovered)
           continue
         }

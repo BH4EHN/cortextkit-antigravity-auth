@@ -591,7 +591,6 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
       const t1 = t0 + 5_000
       let restoreDateNow: (() => void) | undefined
       let fakeTimersEnabled = false
-      let timersRestoredMocks = false
       let persistenceDeadline: ReturnType<typeof setTimeout> | undefined
       let restoreStoreMutate: (() => void) | undefined
       const captured = await setupPoolAdapter({
@@ -721,7 +720,6 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
 
         jest.useRealTimers()
         fakeTimersEnabled = false
-        timersRestoredMocks = true
         restoreStoreMutate = undefined
         storageReadable = true
         const storeMutate = spyOn(
@@ -773,12 +771,9 @@ describe('opencode-v2-antigravity-auth plugin entry', () => {
         restoreDateNow?.()
         if (fakeTimersEnabled) {
           jest.useRealTimers()
-          timersRestoredMocks = true
         }
-        if (!timersRestoredMocks) {
-          storeLoad.mockRestore()
-          save.mockRestore()
-        }
+        storeLoad.mockRestore()
+        save.mockRestore()
         restoreStoreMutate?.()
         await captured.cleanup()
       }

@@ -1,12 +1,24 @@
 import { describe, expect, it, jest } from 'bun:test'
 import { spawn } from 'node:child_process'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   AccountManager,
   AccountManagerPersistenceError,
 } from './account-manager.ts'
 import type { AccountStorageStore } from './account-storage.ts'
-import { mergeAccountStorage } from './account-storage.ts'
+import {
+  AccountStorageLockContentionError,
+  defaultAccountStorageStore,
+  loadAccountStorage,
+  mergeAccountStorage,
+  mutateAccountStorage,
+  saveAccountStorage,
+} from './account-storage.ts'
 import type { AccountStorageV4 } from './account-types.ts'
+import { acquireFencedFileLock } from './file-lock.ts'
+import { generateFingerprint } from './fingerprint.ts'
 
 function createStore(initial: AccountStorageV4 | null = null) {
   let state = initial
@@ -47,6 +59,624 @@ const stored: AccountStorageV4 = {
 }
 
 describe('core AccountManager', () => {
+  for (const externalChange of [
+    'metadata',
+    'rotation',
+    'removal',
+    'addition',
+  ] as const) {
+    it(`preserves independent B ${externalChange} through typed retry and later saves`, async () => {
+      const initial = structuredClone(stored)
+      const memory = createStore(initial)
+      let firstSave = true
+      let external!: AccountStorageV4
+      const manager = new AccountManager(undefined, initial, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path, next) => {
+            if (firstSave) {
+              firstSave = false
+              await memory.store.mutate(path, (current) => ({
+                ...current,
+                accounts:
+                  externalChange === 'removal'
+                    ? current.accounts.slice(0, 1)
+                    : externalChange === 'addition'
+                      ? [
+                          ...current.accounts.map((account) =>
+                            account.refreshToken === 'r2'
+                              ? { ...account, label: 'external B' }
+                              : account,
+                          ),
+                          {
+                            refreshToken: 'external-new',
+                            addedAt: 2,
+                            lastUsed: 0,
+                          },
+                        ]
+                      : current.accounts.map((account) =>
+                          account.refreshToken === 'r2'
+                            ? {
+                                ...account,
+                                label: 'external B',
+                                projectId: 'external project',
+                                refreshToken:
+                                  externalChange === 'rotation'
+                                    ? 'rotated-B'
+                                    : account.refreshToken,
+                              }
+                            : account,
+                        ),
+                activeIndex: externalChange === 'removal' ? 0 : 1,
+                activeIndexByFamily: {
+                  claude: externalChange === 'removal' ? 0 : 1,
+                  gemini: 0,
+                },
+              }))
+              external = structuredClone(memory.state()!)
+              throw new AccountStorageLockContentionError('typed contention', {
+                path,
+                attempts: 6,
+              })
+            }
+            return memory.store.saveMerged(path, next)
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await manager.saveToDisk()
+      expect(memory.state()?.accounts[0]?.label).toBe('local A')
+      expect(memory.state()?.accounts.slice(1)).toEqual(
+        external.accounts.slice(1),
+      )
+      expect(memory.state()?.activeIndexByFamily).toEqual(
+        external.activeIndexByFamily,
+      )
+      manager.getAccounts()[0]!.lastUsed = 321
+      await manager.saveToDisk()
+      expect(memory.state()?.accounts[0]?.lastUsed).toBe(321)
+      expect(memory.state()?.accounts.slice(1)).toEqual(
+        external.accounts.slice(1),
+      )
+      expect(memory.state()?.activeIndex).toBe(external.activeIndex)
+      await manager.flushAndStopSaving()
+      expect(memory.state()?.accounts.slice(1)).toEqual(
+        external.accounts.slice(1),
+      )
+    })
+  }
+
+  it('retains omitted durable metadata on A and unchanged B during initialization maintenance', async () => {
+    const retained = {
+      cachedPerModelQuota: [
+        { modelId: 'model', group: 'claude', remainingFraction: 0.5 },
+      ],
+      coolingDownUntil: 123_456,
+      cooldownReason: 'network-error' as const,
+      lastSwitchReason: 'rotation' as const,
+    }
+    const initial = structuredClone(stored)
+    initial.accounts = initial.accounts.map((account) => ({
+      ...account,
+      ...structuredClone(retained),
+    }))
+    const memory = createStore(initial)
+    const manager = new AccountManager(undefined, initial, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path) => {
+          throw new AccountStorageLockContentionError('typed contention', {
+            path,
+            attempts: 6,
+          })
+        },
+      },
+    })
+    try {
+      manager.getAccounts()[0]!.label = 'local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await manager.saveToDisk()
+      for (const account of memory.state()!.accounts)
+        expect(account).toMatchObject(retained)
+      manager.getAccounts()[0]!.lastUsed = 123
+      await manager.saveToDisk()
+      for (const account of memory.state()!.accounts)
+        expect(account).toMatchObject(retained)
+    } finally {
+      await manager.stopSaving()
+    }
+  })
+
+  it('keeps B changes that precede the failed save baseline read', async () => {
+    const initial = structuredClone(stored)
+    const memory = createStore(initial)
+    let firstRead = true
+    const manager = new AccountManager(undefined, initial, {
+      store: {
+        ...memory.store,
+        load: async (path) => {
+          if (firstRead) {
+            firstRead = false
+            await memory.store.mutate(path, (current) => ({
+              ...current,
+              accounts: current.accounts.map((account) =>
+                account.refreshToken === 'r2'
+                  ? {
+                      ...account,
+                      label: 'B before baseline',
+                      fingerprint: generateFingerprint(),
+                    }
+                  : account,
+              ),
+            }))
+          }
+          return memory.store.load(path)
+        },
+        saveMerged: async (path) => {
+          throw new AccountStorageLockContentionError('typed contention', {
+            path,
+            attempts: 6,
+          })
+        },
+      },
+    })
+    manager.getAccounts()[0]!.label = 'local A'
+    await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+      AccountStorageLockContentionError,
+    )
+    const externalB = structuredClone(memory.state()!.accounts[1])
+    await manager.saveToDisk()
+    expect(memory.state()?.accounts[0]?.label).toBe('local A')
+    expect(memory.state()?.accounts[1]).toEqual(externalB)
+    await manager.stopSaving()
+  })
+
+  it('preserves B between a recovered intent and the queued newer intent', async () => {
+    const initial = structuredClone(stored)
+    const memory = createStore(initial)
+    let enter!: () => void
+    let release!: () => void
+    const entered = new Promise<void>((resolve) => {
+      enter = resolve
+    })
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let mutations = 0
+    const observed: string[] = []
+    const manager = new AccountManager(undefined, initial, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path) => {
+          enter()
+          await gate
+          throw new AccountStorageLockContentionError('typed contention', {
+            path,
+            attempts: 6,
+          })
+        },
+        mutate: async (path, fn) => {
+          mutations++
+          if (mutations === 2) {
+            await memory.store.mutate(path, (current) => ({
+              ...current,
+              accounts: current.accounts.map((account) =>
+                account.refreshToken === 'r2'
+                  ? { ...account, label: 'B between intents' }
+                  : account,
+              ),
+            }))
+          }
+          const result = await memory.store.mutate(path, fn)
+          observed.push(result.accounts[0]!.label!)
+          return result
+        },
+      },
+    })
+    manager.getAccounts()[0]!.label = 'first A'
+    const first = manager.saveToDisk()
+    void first.catch(() => {})
+    await entered
+    manager.getAccounts()[0]!.label = 'queued A'
+    const queued = manager.saveToDisk()
+    void queued.catch(() => {})
+    await memory.store.mutate('', (current) => ({
+      ...current,
+      accounts: current.accounts.map((account) =>
+        account.refreshToken === 'r2'
+          ? { ...account, label: 'B while locked' }
+          : account,
+      ),
+    }))
+    release()
+    await expect(first).rejects.toBeInstanceOf(
+      AccountStorageLockContentionError,
+    )
+    await queued
+    expect(observed).toEqual(['first A', 'queued A'])
+    expect(memory.state()?.accounts[1]?.label).toBe('B between intents')
+    await manager.flushAndStopSaving()
+  })
+
+  for (const conflict of ['metadata', 'rotation', 'removal'] as const) {
+    it(`keeps a typed retry unconfirmed when A has an external ${conflict}`, async () => {
+      const initial = structuredClone(stored)
+      const memory = createStore(initial)
+      const manager = new AccountManager(undefined, initial, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path) => {
+            throw new AccountStorageLockContentionError('typed contention', {
+              path,
+              attempts: 6,
+            })
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await memory.store.mutate('', (current) => ({
+        ...current,
+        accounts:
+          conflict === 'removal'
+            ? current.accounts.slice(1)
+            : current.accounts.map((account) =>
+                account.refreshToken === 'r1'
+                  ? {
+                      ...account,
+                      label: 'external A',
+                      refreshToken:
+                        conflict === 'rotation'
+                          ? 'rotated-A'
+                          : account.refreshToken,
+                    }
+                  : account,
+              ),
+      }))
+      const external = structuredClone(memory.state())
+      await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+        state: 'unconfirmed',
+      })
+      expect(memory.state()).toEqual(external)
+      await manager.stopSaving()
+    })
+  }
+
+  for (const structural of ['replace', 'rotation', 'selection'] as const) {
+    it(`guards a later ${structural} against preserved external B state`, async () => {
+      const initial = structuredClone(stored)
+      const memory = createStore(initial)
+      const manager = new AccountManager(undefined, initial, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path) => {
+            throw new AccountStorageLockContentionError('typed contention', {
+              path,
+              attempts: 6,
+            })
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await memory.store.mutate('', (current) => ({
+        ...current,
+        accounts: current.accounts.map((account) =>
+          account.refreshToken === 'r2'
+            ? { ...account, label: 'external B' }
+            : account,
+        ),
+      }))
+      await manager.saveToDisk()
+      const external = structuredClone(memory.state())
+      if (structural === 'replace') manager.removeAccountByIndex(1)
+      if (structural === 'rotation')
+        manager.updateFromAuth(manager.getAccounts()[0]!, {
+          type: 'oauth',
+          refresh: 'new-A|p1',
+        })
+      if (structural === 'selection') {
+        manager.getCurrentOrNextForFamily('claude', null, 'round-robin')
+        expect(
+          manager.getCurrentOrNextForFamily('claude', null, 'round-robin')
+            ?.index,
+        ).toBe(1)
+      }
+      await expect(
+        structural === 'replace'
+          ? manager.saveToDiskReplace()
+          : manager.saveToDisk(),
+      ).rejects.toMatchObject({ state: 'unconfirmed' })
+      expect(memory.state()).toEqual(external)
+      await manager.stopSaving()
+    })
+  }
+
+  it('retains typed retries across repeated contention without advancing disk provenance', async () => {
+    const initial = structuredClone(stored)
+    const memory = createStore(initial)
+    let retryLocked = true
+    const manager = new AccountManager(undefined, initial, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path) => {
+          throw new AccountStorageLockContentionError('typed contention', {
+            path,
+            attempts: 6,
+          })
+        },
+        mutate: async (path, fn) => {
+          if (retryLocked)
+            throw new AccountStorageLockContentionError('retry contention', {
+              path,
+              attempts: 6,
+            })
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+    manager.getAccounts()[0]!.label = 'first A'
+    await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+      AccountStorageLockContentionError,
+    )
+    manager.getAccounts()[0]!.label = 'newer A'
+    await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+      AccountStorageLockContentionError,
+    )
+    expect(memory.state()?.accounts[0]?.label).toBeUndefined()
+    await memory.store.mutate('', (current) => ({
+      ...current,
+      accounts: current.accounts.map((account) =>
+        account.refreshToken === 'r2'
+          ? { ...account, label: 'external B' }
+          : account,
+      ),
+    }))
+    retryLocked = false
+    await manager.flushAndStopSaving()
+    expect(memory.state()?.accounts[0]?.label).toBe('newer A')
+    expect(memory.state()?.accounts[1]?.label).toBe('external B')
+  })
+
+  it('preserves B in the enabled recovery tail and after recovery reopens saves', async () => {
+    const initial = structuredClone(stored)
+    const memory = createStore(initial)
+    let rejectBeforeCommit = true
+    let scopedWrites = 0
+    const manager = new AccountManager(undefined, initial, {
+      store: {
+        ...memory.store,
+        saveMerged: async (path) => {
+          throw new AccountStorageLockContentionError('typed contention', {
+            path,
+            attempts: 6,
+          })
+        },
+        mutate: async (path, fn) => {
+          if (rejectBeforeCommit) {
+            rejectBeforeCommit = false
+            await fn(structuredClone(memory.state()!))
+            throw new Error('commit unavailable')
+          }
+          scopedWrites++
+          if (scopedWrites === 2) {
+            await memory.store.mutate(path, (current) => ({
+              ...current,
+              accounts: current.accounts.map((account) =>
+                account.refreshToken === 'r2'
+                  ? { ...account, label: 'B before recovery tail' }
+                  : account,
+              ),
+            }))
+          }
+          return memory.store.mutate(path, fn)
+        },
+      },
+    })
+    manager.getAccounts()[0]!.label = 'accepted A'
+    await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+      AccountStorageLockContentionError,
+    )
+    await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+      state: 'unconfirmed',
+    })
+    manager.enableSavingRecovery()
+    manager.getAccounts()[0]!.label = 'late A'
+    manager.requestSaveToDisk()
+    await manager.flushSaveToDisk({ strict: true })
+    expect(memory.state()?.accounts[0]?.label).toBe('late A')
+    expect(memory.state()?.accounts[1]?.label).toBe('B before recovery tail')
+    manager.getAccounts()[0]!.lastUsed = 456
+    await manager.saveToDisk()
+    expect(memory.state()?.accounts[0]?.lastUsed).toBe(456)
+    expect(memory.state()?.accounts[1]?.label).toBe('B before recovery tail')
+    await manager.flushAndStopSaving()
+  })
+
+  for (const concurrentAfterWrite of [false, true]) {
+    it(`reconciles an ambiguous scoped write conservatively (externalAfterWrite=${concurrentAfterWrite})`, async () => {
+      const initial = structuredClone(stored)
+      const memory = createStore(initial)
+      let writes = 0
+      const manager = new AccountManager(undefined, initial, {
+        store: {
+          ...memory.store,
+          saveMerged: async (path) => {
+            throw new AccountStorageLockContentionError('typed contention', {
+              path,
+              attempts: 6,
+            })
+          },
+          mutate: async (path, fn) => {
+            writes++
+            const result = await memory.store.mutate(path, fn)
+            if (writes === 1) throw new Error('response lost after write')
+            return result
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await memory.store.mutate('', (current) => ({
+        ...current,
+        accounts: current.accounts.map((account) =>
+          account.refreshToken === 'r2'
+            ? { ...account, label: 'external B' }
+            : account,
+        ),
+      }))
+      await expect(manager.saveToDisk()).rejects.toThrow(
+        'response lost after write',
+      )
+      expect(memory.state()?.accounts[0]?.label).toBe('local A')
+      if (concurrentAfterWrite) {
+        await memory.store.mutate('', (current) => ({
+          ...current,
+          accounts: current.accounts.map((account) =>
+            account.refreshToken === 'r2'
+              ? { ...account, label: 'B changed after ambiguous write' }
+              : account,
+          ),
+        }))
+        await expect(manager.flushAndStopSaving()).rejects.toMatchObject({
+          state: 'unconfirmed',
+        })
+        expect(writes).toBe(1)
+        await manager.stopSaving()
+      } else {
+        await manager.saveToDisk()
+        manager.getAccounts()[0]!.lastUsed = 789
+        await manager.saveToDisk()
+        expect(memory.state()?.accounts[0]?.lastUsed).toBe(789)
+        expect(memory.state()?.accounts[1]?.label).toBe('external B')
+        await manager.flushAndStopSaving()
+      }
+    })
+  }
+
+  for (const initialKind of ['fallback', 'invalid', 'duplicate'] as const) {
+    it(`retains the whole-pool guard for ${initialKind} initialization`, async () => {
+      const initial = structuredClone(stored)
+      if (initialKind === 'invalid')
+        initial.accounts.push({ refreshToken: '', addedAt: 1, lastUsed: 0 })
+      if (initialKind === 'duplicate')
+        initial.accounts.push({ ...initial.accounts[0]! })
+      const memory = createStore(initial)
+      const manager = new AccountManager(
+        initialKind === 'fallback'
+          ? { type: 'oauth', refresh: 'fallback|project' }
+          : undefined,
+        initial,
+        {
+          store: {
+            ...memory.store,
+            saveMerged: async (path) => {
+              throw new AccountStorageLockContentionError('typed contention', {
+                path,
+                attempts: 6,
+              })
+            },
+          },
+        },
+      )
+      manager.getAccounts()[0]!.label = 'local A'
+      if (initialKind === 'duplicate')
+        manager.getAccounts()[2]!.label = 'local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await manager.flushAndStopSaving()
+      expect(memory.state()?.accounts[0]?.label).toBe('local A')
+      const tokens = memory
+        .state()
+        ?.accounts.map((account) => account.refreshToken)
+      expect(tokens).toEqual(
+        initialKind === 'fallback' ? ['r1', 'r2', 'fallback'] : ['r1', 'r2'],
+      )
+    })
+  }
+
+  it('retries a real pre-write file-lock failure without replacing B or its fingerprint', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'agy-scoped-lock-'))
+    const path = join(root, 'accounts.json')
+    const initial = structuredClone(stored)
+    initial.accounts[0]!.fingerprint = generateFingerprint()
+    initial.accounts[0]!.fingerprint!.userAgent = 'old fingerprint version'
+    let first = true
+    let external!: AccountStorageV4
+    let manager: AccountManager | undefined
+    try {
+      await saveAccountStorage(path, initial)
+      const loaded = await loadAccountStorage(path)
+      manager = new AccountManager(undefined, loaded, {
+        storagePath: path,
+        store: {
+          ...defaultAccountStorageStore,
+          saveMerged: async (target, snapshot) => {
+            if (!first) return saveAccountStorage(target, snapshot)
+            first = false
+            const held = await acquireFencedFileLock({
+              path: target,
+              name: 'accounts',
+              ttlMs: 10_000,
+              renew: false,
+            })
+            expect(held).not.toBeNull()
+            try {
+              external = JSON.parse(
+                await readFile(target, 'utf8'),
+              ) as AccountStorageV4
+              external.accounts[1] = {
+                ...external.accounts[1]!,
+                label: 'real external B',
+                fingerprint: generateFingerprint(),
+              }
+              await writeFile(target, JSON.stringify(external))
+              return await mutateAccountStorage(
+                target,
+                (current) => mergeAccountStorage(current, snapshot),
+                { sleep: async () => {} },
+              )
+            } finally {
+              await held!.release()
+            }
+          },
+        },
+      })
+      manager.getAccounts()[0]!.label = 'real local A'
+      await expect(manager.saveToDisk()).rejects.toBeInstanceOf(
+        AccountStorageLockContentionError,
+      )
+      await manager.saveToDisk()
+      const result = await loadAccountStorage(path)
+      expect(result?.accounts[0]?.label).toBe('real local A')
+      expect(result?.accounts[0]?.fingerprint?.userAgent).toBe(
+        manager.getAccounts()[0]?.fingerprint?.userAgent,
+      )
+      expect(result?.accounts[1]).toEqual(external.accounts[1])
+      manager.getAccounts()[0]!.lastUsed = 123
+      await manager.saveToDisk()
+      await manager.flushAndStopSaving()
+      expect((await loadAccountStorage(path))?.accounts[1]).toEqual(
+        external.accounts[1],
+      )
+    } finally {
+      await manager?.stopSaving()
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
   it('constructs from stored and fallback auth', () => {
     const memory = createStore(stored)
     const manager = new AccountManager(
@@ -894,6 +1524,10 @@ describe('core AccountManager', () => {
       let readable = false
       let reads = 0
       let writes = 0
+      let observeRecovery!: () => void
+      const recoveryObserved = new Promise<void>((resolve) => {
+        observeRecovery = resolve
+      })
       const manager = new AccountManager(undefined, stored, {
         store: {
           ...memory.store,
@@ -901,6 +1535,11 @@ describe('core AccountManager', () => {
             reads++
             if (reads > 1 && !readable) throw new Error('read unavailable')
             return memory.store.load(path)
+          },
+          mutate: async (path, fn) => {
+            const saved = await memory.store.mutate(path, fn)
+            observeRecovery()
+            return saved
           },
           saveMerged: async (path, snapshot) => {
             writes++
@@ -918,6 +1557,8 @@ describe('core AccountManager', () => {
       manager.getAccounts()[0]!.label = 'latest'
       manager.requestSaveToDisk()
       await jest.advanceTimersByTime(1000)
+      await recoveryObserved
+      await manager.flushSaveToDisk({ strict: true })
       await manager.saveToDisk()
       expect(memory.state()?.accounts[0]?.label).toBe('latest')
     } finally {
@@ -1059,6 +1700,10 @@ describe('core AccountManager', () => {
         markWriteStarted = resolve
       })
       let blockRecoveryWrite = false
+      let observeLateWrite!: () => void
+      const lateWriteObserved = new Promise<void>((resolve) => {
+        observeLateWrite = resolve
+      })
       const manager = new AccountManager(undefined, stored, {
         store: {
           ...memory.store,
@@ -1071,6 +1716,7 @@ describe('core AccountManager', () => {
             await memory.store.mutate(path, (current) =>
               mergeAccountStorage(current, next),
             )
+            if (next.accounts[0]?.label === 'late') observeLateWrite()
             throw new Error('response lost')
           },
           mutate: async (path, fn) => {
@@ -1103,6 +1749,7 @@ describe('core AccountManager', () => {
       await recovery
       expect(memory.state()?.accounts[0]?.label).toBe('captured')
       await jest.advanceTimersByTime(1000)
+      await lateWriteObserved
       expect(memory.state()?.accounts[0]?.label).toBe('late')
     } finally {
       jest.useRealTimers()
@@ -1446,7 +2093,6 @@ describe('core AccountManager', () => {
     `
     const child = spawn(process.execPath, ['-e', script], {
       cwd: process.cwd(),
-      env: { ...process.env, TMPDIR: '/private/tmp' },
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
